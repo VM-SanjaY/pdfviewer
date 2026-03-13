@@ -1,0 +1,5021 @@
+"""
+PDF Annotation Tool - PDF EDITOR
+Copyright (C) 2025 Agira Tech
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU General Public License as published by
+the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License
+along with this program. If not, see <https://www.gnu.org/licenses/>.
+"""
+
+import os
+import re
+import io
+import math
+from datetime import date
+import cairosvg
+import fitz
+import time
+import textwrap
+from PIL import Image, ImageTk, ImageOps
+import requests
+from urllib.parse import urlparse, unquote, parse_qs
+from duplicate_window import DuplicateStickyNotesPDFApp
+import socket
+import threading
+import sys
+from protocol_handler import ProtocolHandler
+import customtkinter as ctk
+from tkinter import filedialog, messagebox
+import mysql.connector
+from dotenv import load_dotenv
+
+# to get the environment variables for exe
+base_dir = getattr(sys, '_MEIPASS', os.path.abspath(os.path.dirname(__file__)))
+env_path = os.path.join(base_dir, '.env')
+
+# ✅ Load .env from the correct location
+load_dotenv(env_path)
+
+
+host = os.getenv("MYSQL_HOST")
+user = os.getenv("MYSQL_USER")
+password = os.getenv("MYSQL_PASSWORD")
+database = os.getenv("MYSQL_DATABASE")
+# Establish db connection
+mydb = mysql.connector.connect(
+    host="127.0.0.1",
+    user=user,
+    password=password,
+    database=database,
+    unix_socket=None
+)
+
+mycursor = mydb.cursor()
+
+class StickyNotesPDFApp:
+    SOCKET_PORT = 65432 # default socket port for handling the url
+
+    def __init__(self, root):
+        self.root = root
+        # Set minimum size for the window to prevent excessive shrinking
+        self.file_name_is = "attachment_file.pdf"
+        # icon for the window title
+        icon_path = os.path.join(os.path.dirname(__file__), '..', 'assets', 'Atic.png')
+        self.root.iconbitmap(self.set_window_icon(icon_path))
+        self.zoom_factor = 1.0
+        self.display_name = ""
+        self.file_date_time = ""
+        self.time_redact_used = 0
+        self.rendered_page_count = 0
+        self.lock_screen = "no"
+        self.stickynotezoomy = 1.0
+        self.annotation_is_available = False
+        self.redact_is_available = False
+        self.page_rotation = 0
+        self.sticky_note_mode = False
+        self.highlight_mode = False
+        self.is_drawing_line = False
+        self.is_drawing_arrow = False
+        self.is_drawing_hollow_rect = False  # For hollow rectangle tool
+        self.is_drawing_filled_rect = False
+        self.is_drawing_hollow_circle = False  # Initialize the attribute
+        self.is_drawing_filled_circle = False  # Initialize for filled circle too
+        self.last_x, self.last_y = None, None
+        self.current_line = None
+        self.current_rectangle = None
+        self.annotation_listed = []
+        self.rectangle_id = None
+        self.annotations = [] # Will store all annotations
+        self.lines = []  # Store line annotations
+        self.arrows = []  # Store arrow annotations
+        self.rectangles = [] 
+        self.change_history = []
+        self.change_redact_history = []
+        self.sticky_notes = {}
+        self.thumbnails = []
+        self.thumbnail_labels = []  # Initialize the missing attribute
+        self.thumbnail_cache = {}
+        # self.thumbnails_rendered = False
+        self.freehand_drawings = []
+        self.redactions = []  # To store redaction info (coordinates)
+        self.redo_redactions = []
+        self.text_annotations = {}
+        self.text_annotations_bg = {}
+        self.page_drawings = {}
+        self.icons = {}
+        self.polygons = []
+        self.istempfile = False
+        self.duplicate_windows = []
+        # Track scroll position and reset attempts
+        self.last_scroll_position = 0
+        self._scroll_reset_job = None
+        self._selection_attempts = 0
+        self._thumbnails_rendering = False
+        self._target_page_after_load = 0
+        self.redaction_mode = False
+        self.delete_mode = False
+        self.pdf_document = None
+        self.current_page = None
+        self.is_inverted = False
+        self.is_drawing = False  # Default state of the drawing mode
+        self.last_x, self.last_y = None, None  # Initialize these as well
+        self.polygon_mode = None  # 'filled' or 'hollow'
+        self.polygon_size = 50
+        self.start_point = None
+        self.pagenumber_url = None
+        # New attributes for handling movable images
+        self.image_overlays = [] 
+        # create buttons on the window frame
+        self.create_widgets()
+        self.canvas.bind("<Button-1>", self.on_canvas_click) # Left click to draw
+        self.canvas.bind("<Motion>", self.on_mouse_hover) # Hover to show
+        self.root.bind("<Left>", self.prev_page)  # Left arrow for previous page
+        self.root.bind("<Right>", self.next_page)  # Right arrow for next page
+        self.root.bind("<Up>", self.prev_page)  # Left arrow for previous page
+        self.root.bind("<Down>", self.next_page)  # Right arrow for next page
+        self.active_tooltip = None
+        # default page size
+        self.page_width = 0
+        self.page_height = 0
+        self.root.protocol("WM_DELETE_WINDOW", self.close_main_window) # to allow the main window to close
+        self.setup_ipc_server()
+        self.temp_file_path = None
+        # api to save the annotated and redact file
+        # recieving the url from the protocol handler
+        if len(sys.argv) > 1:
+            pdf_url = ProtocolHandler.handle_protocol_url(sys.argv[1])
+            server_url = pdf_url.split(".com")[0]
+            # server_url = "http://172.20.1.218:3001/api/v1"
+            self.server_url = server_url+r".com/api/v1/uploads/file-annotations"
+            print("server url-----------------------------------------------------------------------------------------------",self.server_url)
+            if "Temp" in pdf_url:
+                self.istempfile = True
+                print("temp file path-----------------------------------------------------------------------------------------------",self.temp_file_path)
+            self.handle_url(pdf_url)
+            extracted_filename = self.extract_filename(pdf_url)
+            print("hxfxfxnxncgcg----------------------------",pdf_url)
+            if extracted_filename:
+                self.file_name_is = extracted_filename
+        self.root.title(f"IDMS Viewer v1.8.1 - {self.display_name} {self.file_date_time}")
+    def extract_filename(self,url):
+        match = re.search(r'/(?P<filename>[^/]+\.pdf)', url)
+        return match.group("filename") if match else None
+    # window icon 
+    def set_window_icon(self, icon_path):
+        if os.path.exists(icon_path):
+            try:
+                self.root.iconphoto(True, ImageTk.PhotoImage(file=icon_path))
+            except Exception as e:
+                print(f"Failed to set window icon. Error: {e}")
+        else:
+            print(f"Icon file not found: {icon_path}")
+
+    def create_widgets(self):
+        self.should_be_maximized = True
+        # Main toolbar container frame
+        toolbar_container = ctk.CTkFrame(self.root)
+        toolbar_container.pack(fill=ctk.X, pady=8)
+        
+        # Scrollable canvas for toolbar
+        toolbar_canvas = ctk.CTkCanvas(toolbar_container, height=80, highlightthickness=0)
+        toolbar_canvas.pack(side=ctk.TOP, fill=ctk.X, expand=True)
+        
+        # Horizontal scrollbar for toolbar
+        toolbar_scrollbar = ctk.CTkScrollbar(toolbar_container, orientation="horizontal", command=toolbar_canvas.xview)
+        toolbar_scrollbar.pack(side=ctk.BOTTOM, fill=ctk.X)
+        toolbar_canvas.configure(xscrollcommand=toolbar_scrollbar.set)
+        
+        # Frame inside canvas to hold toolbar buttons
+        toolbar = ctk.CTkFrame(toolbar_canvas)
+        canvas_window = toolbar_canvas.create_window((0, 0), window=toolbar, anchor="nw")
+        
+        # Minimum width for toolbar
+        min_toolbar_width = 23 * 48 + 150  # 150px for navigation frame
+        
+        # Update scroll region when toolbar size changes
+        def update_toolbar_scroll_region(event=None):
+            toolbar_canvas.configure(scrollregion=(0, 0, max(min_toolbar_width, toolbar.winfo_reqwidth()), toolbar.winfo_reqheight()))
+            toolbar_canvas.itemconfig(canvas_window, width=max(min_toolbar_width, toolbar.winfo_reqwidth()))
+        
+        toolbar.bind("<Configure>", update_toolbar_scroll_region)
+        
+        # Configure canvas width based on window size
+        def configure_canvas_width(event):
+            if event.width < min_toolbar_width:
+                toolbar_canvas.itemconfig(canvas_window, width=min_toolbar_width)
+                toolbar_canvas.configure(scrollregion=(0, 0, min_toolbar_width, toolbar.winfo_reqheight()))
+            else:
+                toolbar_canvas.itemconfig(canvas_window, width=event.width)
+        
+        toolbar_canvas.bind("<Configure>", configure_canvas_width)
+        toolbar.configure(width=min_toolbar_width)
+        def create_button(parent, text="", image=None, command=None, tooltip_text=""):
+            button = ctk.CTkButton(
+                parent,
+                text=text,
+                image=image,
+                command=command,
+                fg_color="#00498f",
+                text_color="white",
+                hover_color="#023261",
+                font=("Arial", 12),
+                width=45
+            )
+            button.pack(side=ctk.LEFT, padx=3, pady=2)
+            button.bind("<Enter>", lambda event, b=text, t=tooltip_text: self.button_tooltip(event, b, t))
+            button.bind("<Leave>", self.hide_tooltip)
+            return button
+    # load images in the button
+        def load_image(relative_path, size=(25, 25)):
+            if getattr(sys, 'frozen', False):
+                base_dir = sys._MEIPASS
+            else:
+                base_dir = os.path.dirname(os.path.abspath(__file__))
+            full_path = os.path.join(base_dir, relative_path)
+            if relative_path.lower().endswith('.svg'):
+                png_data = cairosvg.svg2png(url=full_path)
+                image = Image.open(io.BytesIO(png_data))
+            else:
+                image = Image.open(full_path)
+            image = image.resize(size, Image.LANCZOS)
+            return ImageTk.PhotoImage(image)
+        # for tool tip and image identification   
+        self.icons = {
+            "lock": load_image("assets/lock.svg"),
+            "unlock": load_image("assets/unlock.svg"),
+            "load_pdf": load_image("assets/folder.svg"),
+            "new_window": load_image("assets/new_window.svg"),
+            "zoom_out": load_image("assets/zoom_out.svg"),
+            "zoom_in": load_image("assets/zoom_in.svg"),
+            "refresh_pdf": load_image("assets/refresh.svg"),
+            "prev_page": load_image("assets/prev_page.svg"),
+            "next_page": load_image("assets/next_page.svg"),
+            "delete": load_image("assets/delete.svg"),
+            "undo": load_image("assets/undo.svg"),
+            "highlight": load_image("assets/highlight.svg"),
+            "sticky_note": load_image("assets/note.svg"),
+            "thumb_pin": load_image("assets/thumb_pin_yellow.svg"),
+            "rotate_90": load_image("assets/rotate_90.svg"),
+            "rotate_180": load_image("assets/rotate_180.svg"),
+            "rotate_270": load_image("assets/rotate_270.svg"),
+            "best_fit": load_image("assets/fit_to_page.svg"),
+            "best_width": load_image("assets/width.svg"),
+            "best_height": load_image("assets/height.svg"),
+            "invert_colors": load_image("assets/ying_yang.svg"),
+            "save_pdf": load_image("assets/save.svg"),
+            "zoom_area": load_image("assets/Area.svg"),
+            "free_line": load_image("assets/line.svg"),
+            "filled_polygon": load_image("assets/filled5polygon.svg"),
+            "hollow_polygon": load_image("assets/hollow5polygon.svg"),
+            "straightline": load_image("assets/straightline.svg"),
+            "arrow": load_image("assets/arrow.svg"),
+            "hollow_rectangle": load_image("assets/hollow_rectangle.svg"),
+            "filled_rectangle": load_image("assets/filled_rectangle.svg"),
+            "hollow_ellipse": load_image("assets/hollow_ellipse.svg"),
+            "filled_ellipse": load_image("assets/filled_ellipse.svg"),
+            "text": load_image("assets/text.svg"),
+            "filled_text": load_image("assets/filled_text.svg"),
+            "image": load_image("assets/image.svg"),
+            "selectarrow": load_image("assets/selectarrow.svg"), 
+            "redact": load_image("assets/redact.svg"), 
+            "removeredact": load_image("assets/remove.svg"), 
+            "eye": load_image("assets/eye.svg"), 
+        }
+
+        # if self.istempfile:
+        #     button_configs = [
+        #         {"image": self.icons['zoom_out'], "command": self.zoom_out, "tooltip": "Zoom Out"},
+        #         {"image": self.icons['zoom_in'], "command": self.zoom_in, "tooltip": "Zoom In"},
+        #         {"image": self.icons['rotate_90'], "command": self.rotate_90clockwise, "tooltip": "Rotate 90° Right"},
+        #         {"image": self.icons['rotate_180'], "command": self.rotate_180clockwise, "tooltip": "Rotate 180° Right"},
+        #         {"image": self.icons['rotate_270'], "command": self.rotate_270clockwise, "tooltip": "Rotate 270° Right"},
+        #         {"image": self.icons['best_fit'], "command": self.best_fit, "tooltip": "Best Fit"},
+        #         {"image": self.icons['best_width'], "command": self.best_width, "tooltip": "Best Width"},
+        #         {"image": self.icons['best_height'], "command": self.best_height, "tooltip": "Best Height"},
+        #     ]
+        # else:
+        if self.lock_screen == "no":
+            button_configs = [
+                {"image": self.icons['lock'], "command": self.lock_function, "tooltip": "Lock Annotations"},
+                {"image": self.icons['selectarrow'], "command": self.activate_selection_mode, "tooltip": "Zoom Selected Area"},
+                # {"image": self.icons['eye'], "command": self.show_annotated_file, "tooltip": "Show Annotated File"},
+                {"image": self.icons['refresh_pdf'], "command": self.refresh, "tooltip": "Refresh Document"},
+                # {"image": self.icons['load_pdf'], "command": self.load_pdf, "tooltip": "Load PDF"},
+                {"image": self.icons['new_window'], "command": lambda: self.create_duplicate_window(fileurl), "tooltip": "New Window"},
+                {"image": self.icons['zoom_out'], "command": self.zoom_out, "tooltip": "Zoom Out"},
+                {"image": self.icons['zoom_in'], "command": self.zoom_in, "tooltip": "Zoom In"},
+                # {"image": self.icons['zoom_area'], "command": self.toggle_zoom_in_area_mode, "tooltip": "Zoom Area"},
+                {"image": self.icons['highlight'], "command": self.enable_highlight_mode, "tooltip": "Highlight","instance_var":"highlight_button"},
+                # {"image": self.icons['highlight'], "command": self.enable_delete_highlight_mode, "tooltip": "Delete Highlight","instance_var":"highlight_button"},
+                {"image": self.icons['sticky_note'], "command": self.toggle_sticky_note_mode, "tooltip": "Sticky Note", "instance_var":"sticky_note_button"},
+                {"image": self.icons['undo'], "command": self.undo_change, "tooltip": "Undo"},
+                {"image": self.icons['delete'], "command": self.enable_delete_annotation_mode, "tooltip": "Delete Annotation", "instance_var":"delete_button"},
+                {"image": self.icons['rotate_90'], "command": self.rotate_90clockwise, "tooltip": "Rotate 90° Right"},
+                {"image": self.icons['rotate_180'], "command": self.rotate_180clockwise, "tooltip": "Rotate 180° Right"},
+                {"image": self.icons['rotate_270'], "command": self.rotate_270clockwise, "tooltip": "Rotate 270° Right"},
+                {"image": self.icons['best_fit'], "command": self.best_fit, "tooltip": "Best Fit"},
+                {"image": self.icons['best_width'], "command": self.best_width, "tooltip": "Best Width"},
+                {"image": self.icons['best_height'], "command": self.best_height, "tooltip": "Best Height"},
+                {"image": self.icons['invert_colors'], "command": self.toggle_invert_colors, "tooltip": "Invert Colors", "instance_var":"invert_button"},
+                {"image": self.icons['save_pdf'], "command": self.save_pdf, "tooltip": "Save PDF"},
+                # {"image": self.icons['save_pdf'], "command": self.save_pdf_type2, "tooltip": "Save PDF"},
+                # Buttons with instance variables
+                {"image": self.icons['text'], "command": self.add_text_to_pdf, "tooltip": "Add Text", "instance_var": "text_button"},
+                {"image": self.icons['filled_text'], "command": self.add_text_with_background, "tooltip": "Add Text Stamp", "instance_var": "text_bg_button"},
+                {"image": self.icons['free_line'], "command": self.toggle_drawing, "tooltip": "Free Hand Line", "instance_var": "draw_button"},
+                {"image": self.icons['filled_polygon'], "command": self.toggle_filled_polygon_mode, "tooltip": "Draw Filled Polygon", "instance_var": "filled_polygon_button"},
+                {"image": self.icons['hollow_polygon'], "command": self.toggle_hollow_polygon_mode, "tooltip": "Draw Hollow Polygon", "instance_var": "hollow_polygon_button"},
+                {"image": self.icons.get('image'), "command": lambda: self.attach_image_to_pdf(), "tooltip": "Attach Image", "instance_var": "image_button"},
+                {"image": self.icons['straightline'], "command": self.activate_line_tool, "tooltip": "Draw Straight Line", "instance_var": "line_button"},
+                {"image": self.icons['arrow'], "command": self.activate_arrow_tool, "tooltip": "Draw Arrow", "instance_var": "arrow_button"},
+                {"image": self.icons['hollow_rectangle'], "command": self.activate_hollow_rectangle_tool, "tooltip": "Draw Hollow Rectangle", "instance_var": "hollow_rectangle_button"},
+                {"image": self.icons['filled_rectangle'], "command": self.activate_filled_rectangle_tool, "tooltip": "Draw Filled Rectangle", "instance_var": "filled_rectangle_button"},
+                {"image": self.icons['hollow_ellipse'], "command": self.activate_hollow_ellipse, "tooltip": "Draw Hollow Ellipse", "instance_var": "hollow_ellipse_button"},
+                {"image": self.icons['filled_ellipse'], "command": self.activate_filled_ellipse, "tooltip": "Draw Filled Ellipse", "instance_var": "filled_ellipse_button"},
+                # {"image": self.icons['redact'], "command": self.toggle_redaction_mode, "tooltip": "Add Redaction"},
+                # {"image": self.icons['removeredact'], "command": self.remove_black_boxes, "tooltip": "Remove Redaction"},
+                {"image": self.icons['redact'], "command": self.activate_black_rectangle_tool, "tooltip": "Add Redaction", "instance_var": "redact_button"},
+                {"image": self.icons['removeredact'], "command": self.undo_blackrect, "tooltip": "Remove Redaction"}, 
+            ]
+        else:
+            button_configs = [
+                {"image": self.icons['unlock'], "command": self.lock_function, "tooltip": "Unlock Annotations"},
+                {"image": self.icons['zoom_out'], "command": self.zoom_out, "tooltip": "Zoom Out"},
+                {"image": self.icons['zoom_in'], "command": self.zoom_in, "tooltip": "Zoom In"},
+                {"image": self.icons['rotate_90'], "command": self.rotate_90clockwise, "tooltip": "Rotate 90° Right"},
+                {"image": self.icons['rotate_180'], "command": self.rotate_180clockwise, "tooltip": "Rotate 180° Right"},
+                {"image": self.icons['rotate_270'], "command": self.rotate_270clockwise, "tooltip": "Rotate 270° Right"},
+                {"image": self.icons['best_fit'], "command": self.best_fit, "tooltip": "Best Fit"},
+                {"image": self.icons['best_width'], "command": self.best_width, "tooltip": "Best Width"},
+                {"image": self.icons['best_height'], "command": self.best_height, "tooltip": "Best Height"},
+            ]
+        # Create a vertical layout manager frame
+        rows_container = ctk.CTkFrame(toolbar)
+        rows_container.pack(side=ctk.TOP, fill=ctk.BOTH)
+        
+        # Create the first row frame
+        current_row = ctk.CTkFrame(rows_container)
+        current_row.pack(side=ctk.TOP, fill=ctk.X)
+        
+        # Add buttons with row wrapping
+        buttons_in_row = 0
+        for config in button_configs:
+            if buttons_in_row >= 23:  # Start a new row when we hit 23 buttons
+                current_row = ctk.CTkFrame(rows_container)
+                current_row.pack(side=ctk.TOP, fill=ctk.X)
+                buttons_in_row = 0
+            
+            button = create_button(
+                current_row,
+                image=config["image"],
+                command=config["command"],
+                tooltip_text=config["tooltip"])
+            
+            buttons_in_row += 1
+            
+            if "instance_var" in config:
+                setattr(self, config["instance_var"], button)
+        # button frame         
+        nav_frame = ctk.CTkFrame(current_row, height=25)  # Place inside current_frame    
+        nav_frame.pack(side=ctk.LEFT, pady=0, padx=5)  # Align with buttons
+
+        # navigation buttons
+        prev_button = ctk.CTkButton(nav_frame, text="<<<", command=self.prev_page, width=30, fg_color="transparent", text_color="black")
+        prev_button.pack(side=ctk.LEFT, padx=0)
+        # button for page jump
+        self.page_entry = ctk.CTkEntry(nav_frame, width=45, justify="center", height=20)
+        self.page_entry.pack(side=ctk.LEFT, padx=0)
+        self.page_entry.insert(0, "1")
+        self.page_entry.bind("<Return>", self.go_to_page, add="+")
+        # total page count
+        self.page_total_label = ctk.CTkLabel(nav_frame, text="/ ?", width=25, fg_color="transparent", text_color="black")
+        self.page_total_label.pack(side=ctk.LEFT, padx=0)
+        # next button navigation
+        next_button = ctk.CTkButton(nav_frame, text=">>>", command=self.next_page, width=30, fg_color="transparent", text_color="black")
+        next_button.pack(side=ctk.LEFT, padx=0)
+
+        # Add mouse wheel scrolling for toolbar
+        def on_toolbar_mousewheel(event):
+            if event.state & 0x0001:  # Check if Shift key is pressed
+                toolbar_canvas.xview_scroll(int(-1*(event.delta/120)), "units")
+        
+        toolbar_canvas.bind("<MouseWheel>", on_toolbar_mousewheel)
+        
+        # Update scroll region after a short delay
+        self.root.after(100, update_toolbar_scroll_region)
+
+        # go button but hidden
+        if getattr(self, "canvas_frame", None) is None:
+            canvas_frame = ctk.CTkFrame(self.root)
+            canvas_frame.pack(fill=ctk.BOTH, expand=True)
+            # thumbnail frame size
+            self.thumbnail_frame = ctk.CTkFrame(canvas_frame, width=175, fg_color="lightgray")
+            self.thumbnail_frame.pack(side=ctk.LEFT, fill=ctk.Y)            
+            # this one is with the total thumnail frame incliding scrollbar
+            self.thumbnail_canvas = ctk.CTkCanvas(self.thumbnail_frame, bg="lightgray", width=250)
+            # self.thumbnail_scrollbar = ctk.CTkScrollbar(self.thumbnail_frame, orientation="vertical", command=self.thumbnail_canvas.yview)
+            self.thumbnail_scrollbar = ctk.CTkScrollbar(self.thumbnail_frame, orientation="vertical", command=self.thumbnail_canvas.yview, width=20)
+            self.thumbnail_canvas.configure(yscrollcommand=self.thumbnail_scrollbar.set)
+            self.thumbnail_canvas.pack(side=ctk.LEFT, fill=ctk.BOTH, expand=True)
+            # self.thumbnail_scrollbar.pack(side=ctk.RIGHT, fill=ctk.Y)
+            self.thumbnail_scrollbar.pack(side=ctk.RIGHT, fill=ctk.Y, padx=2)
+            # self.thumbnail_canvas.bind("<MouseWheel>", self.on_thumbnail_scroll)
+            self.inner_thumbnail_frame = ctk.CTkFrame(self.thumbnail_canvas, fg_color="lightgray")
+            self.thumbnail_canvas.create_window((0, 0), window=self.inner_thumbnail_frame, anchor="nw")
+            self.inner_thumbnail_frame.bind("<Configure>", lambda e: self.update_scroll_region() if self.pdf_document else None)
+            # total main frame size
+            self.canvas = ctk.CTkCanvas(canvas_frame, bg="lightgray", width=1050, height=750) # 
+            self.h_scrollbar = ctk.CTkScrollbar(canvas_frame, orientation="horizontal", command=self.canvas.xview)
+            self.v_scrollbar = ctk.CTkScrollbar(canvas_frame, orientation="vertical", command=self.canvas.yview)
+            self.canvas.configure(xscrollcommand=self.h_scrollbar.set, yscrollcommand=self.v_scrollbar.set)
+            self.h_scrollbar.pack(side=ctk.BOTTOM, fill=ctk.X)
+            self.v_scrollbar.pack(side=ctk.RIGHT, fill=ctk.Y)
+            self.canvas.pack(side=ctk.LEFT, fill=ctk.BOTH, expand=True)
+            # mouse wheel event for pdf render window for scrolling the pdf render
+            self.canvas.bind("<MouseWheel>", self.on_mouse_scroll)
+            self.canvas.bind("<Shift-MouseWheel>", self.on_shift_mouse_scroll)
+            
+    # to show the button name when hover
+    def button_tooltip(self, event, button_text, tooltip_text):
+        """Display tooltip when hovering over a button."""
+        if self.active_tooltip:
+            self.active_tooltip.destroy() # to destroy automatiacally each second
+        tooltip = ctk.CTkToplevel(self.root)
+        tooltip.wm_overrideredirect(True) # it used for closing tooltip
+        tooltip.wm_geometry(f"+{event.x_root + 10}+{event.y_root + 10}")  # text Position near the mouse hover
+        # tooltip design
+        label = ctk.CTkLabel(tooltip, text=tooltip_text, fg_color="light yellow",text_color="black", padx=5, pady=5)
+        label.pack()
+        if self.active_tooltip:
+            self.active_tooltip.destroy()
+        # activating tool tip
+        self.active_tooltip = tooltip
+        
+    # remove or deactivate when not over
+    def hide_tooltip(self, event):
+        """Hide tooltip when the mouse leaves the button."""
+        if self.active_tooltip: 
+            self.active_tooltip.destroy()
+            self.active_tooltip = None
+    # load the pdf in the same frame
+    def setup_ipc_server(self):
+        """Set up a socket server for inter-process communication."""
+        self.ipc_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            self.ipc_socket.bind(("localhost", self.SOCKET_PORT)) # localhost should be changes to server doman
+            self.ipc_socket.listen(1)
+            threading.Thread(target=self.ipc_listener, daemon=True).start()
+        except socket.error:
+            # Another instance is running; send the URL to it
+            if len(sys.argv) > 1:
+                pdf_url = ProtocolHandler.handle_protocol_url(sys.argv[1])
+                self.send_to_running_instance(pdf_url)
+            sys.exit()
+    # to listen the the url recieved from the server
+    def ipc_listener(self):
+        """Listen for incoming URLs and handle them."""
+        while True:
+            conn, _ = self.ipc_socket.accept()
+            with conn:
+                data = conn.recv(1024).decode("utf-8")
+                if data:
+                    self.root.after(0, self.handle_url, data)
+    # to establish the url connection from the server
+    def send_to_running_instance(self, url):
+        """Send the URL to the running instance."""
+        try:
+            with socket.create_connection(("localhost", self.SOCKET_PORT)) as client_socket:
+                client_socket.sendall(url.encode("utf-8"))
+        except socket.error:
+            print("Failed to send URL to running instance.")
+
+    # def split_url(self,url):
+    #     first_split = url.split('?', 1)
+    #     if len(first_split) < 2:
+    #         return url, ''
+    #     base, rest = first_split
+    #     second_split = rest.split('?', 1)
+    #     if len(second_split) == 2:
+    #         return f"{base}?{second_split[0]}", f"?{second_split[1]}"
+    #     else:
+    #         return f"{base}?{rest}", ''
+
+    def split_url(self, url):
+        pdf_index = url.lower().find('.pdf')
+        if pdf_index == -1:
+            return url, ''
+        
+        part1 = url[:pdf_index + 4]  # Include ".pdf"
+        part2 = url[pdf_index + 4:]  # Everything after ".pdf"
+        return part1.strip(), part2.strip()
+
+    #to handle url and filter the page number when passed
+    def handle_url(self, url):
+        """Handle a new URL (load the PDF) and restore the window if minimized."""
+        try:
+            print("dzdzdbzbd",url)
+            extracted_filename = self.extract_filename(url)  # Extract new filename
+            if extracted_filename:
+                self.file_name_is = extracted_filename  # Update the filename
+                print("extracted filename",self.file_name_is)
+            
+            part1, part2 = self.split_url(url)
+
+            print("part1-------",part1)
+            print("part2-------",part2)
+            query = part2.lstrip("?")        
+            # Parse the query string
+            params = parse_qs(query)
+
+            user_id = params.get("user_id", [None])[0]
+            page_number = params.get("page_number", [None])[0]
+            view_redact = params.get("view_redact", [None])[0]
+            doc_id = params.get("doc_id", [None])[0]
+            self.account_name= params.get("account_name", [None])[0]
+            self.display_name = params.get("display_name", [None])[0]
+            self.file_date_time = params.get("date_time", [None])[0]
+            if self.file_date_time == None:
+                self.file_date_time = ""
+            if self.display_name == None:
+                self.display_name = ""
+            # Optional: Cast page_number to int if needed
+
+            if page_number is not None:
+                try:
+                    page_number = int(page_number)
+                except ValueError:
+                    print("Invalid page_number, expected int.")
+                    page_number = None
+            print("params",params)
+            self.pagenumber_url = page_number
+            self.view_redact = view_redact
+            self.doc_id = doc_id
+            self.loaderurl = part1.split('.com/')[0] + '.com/api/v1/samba/'+"close-file-loader/"+user_id
+            # self.loaderurl = "http://172.20.1.218:3001/api/v1/"+"samba/"+"close-file-loader/"+user_id
+            print("loader url",self.loaderurl)
+            print("user id",user_id)
+            print("page number",page_number)
+            print("view redact",view_redact)
+            print("doc id",doc_id)
+
+            print("display name",self.display_name)
+            print("file date time",self.file_date_time)
+            print("part1",part1)
+            print("part2",part2)
+            self.pdf_file_url = part1
+            print("pdf file url",self.pdf_file_url)
+            print("--------------------url---------------------",url)
+            self.load_pdf(url)
+            # Update the window title with the new file name
+            self.root.title(f"IDMS Viewer v1.8.1 - {self.display_name} {self.file_date_time}")
+            threading.Thread(target=self.notify_loader, daemon=True).start() 
+
+        except Exception as e:
+            threading.Thread(target=self.notify_loader, daemon=True).start()
+            print(f"Failed to load PDF in handle_url: {e}")
+
+    # Enable or disable scrollbar based on the number of pages
+    def update_scroll_region(self):
+        """Ensures that the scroll region updates properly when thumbnails are added."""
+        self.inner_thumbnail_frame.update_idletasks()  # Ensure layout updates first
+        self.thumbnail_canvas.configure(scrollregion=self.thumbnail_canvas.bbox("all"))
+ 
+        # Enable or disable scrollbar based on the number of pages
+        if len(self.pdf_document) > 4:
+            self.thumbnail_scrollbar.pack(side=ctk.RIGHT, fill=ctk.Y)
+            self.thumbnail_canvas.configure(yscrollcommand=self.thumbnail_scrollbar.set)
+        else:
+            self.thumbnail_scrollbar.pack_forget()  # Hide scrollbar
+            self.thumbnail_canvas.configure(yscrollcommand="")  # Disable scrolling
+    
+    def notify_loader(self):
+        try:
+            print("Notifying loader server...")
+            print("Loader URL===================================-", self.loaderurl)
+            response = requests.get(self.loaderurl, timeout=2)
+            print("Loader notified, status code:", response.status_code)
+        except Exception as e:
+            print(e)
+
+    # def _load_pdf_internal(self):
+    #     """Internal function that handles PDF loading (called in a thread)."""
+    #     self.root.after(0, lambda: self.canvas.config(cursor="watch"))  # show wait cursor
+    #     try:
+    #         self.root.after(1500, lambda: self.best_fit())
+    #     except:
+    #         print("Error in best_fit in load pdf") 
+    #     finally:
+    #         self.root.after(0, lambda: self.canvas.config(cursor=""))
+
+    def _load_pdf_internal(self):
+        """Internal function that handles PDF loading (called in a thread)."""
+        self.root.after(0, lambda: self.canvas.config(cursor="watch"))  # show wait cursor
+        try:
+            # Instead of using a fixed timer, call best_fit after the page is fully rendered
+            # We'll use update_idletasks to ensure UI is updated before calling best_fit
+            self.root.after(0, lambda: self.root.update_idletasks())
+            self.root.after(100, lambda: self.canvas.update_idletasks())
+            # Now call best_fit with a slight delay to ensure canvas size is established
+            self.root.after(500, lambda: self.ensure_best_fit())
+        except:
+            print("Error in best_fit in load pdf") 
+        finally:
+            self.root.after(0, lambda: self.canvas.config(cursor=""))
+
+    def ensure_best_fit(self):
+        """Ensures best_fit is called properly with canvas fully initialized"""
+        if self.pdf_document and self.current_page is not None:
+            # Check if canvas has actual dimensions
+            canvas_width = self.canvas.winfo_width()
+            canvas_height = self.canvas.winfo_height()
+            
+            if canvas_width <= 1 or canvas_height <= 1:
+                # Canvas not yet properly sized, try again after a short delay
+                print("Canvas not yet sized, retrying best_fit...")
+                self.root.after(200, self.ensure_best_fit)
+            else:
+                # Canvas is ready, apply best_fit
+                print(f"Applying best_fit with canvas size: {canvas_width}x{canvas_height}")
+                self.best_fit()
+
+    def _timed_render_page(self, page):
+        start_time = time.time()
+        self.render_page(page)
+        end_time = time.time()
+        print(f"render_page execution time: {end_time - start_time:.4f} seconds")
+
+    def ensure_thumbnail_selection(self, page_number):
+        """Ensures thumbnail selection happens after thumbnails are properly rendered"""
+        if not self.pdf_document or not hasattr(self, 'thumbnails'):
+            self.root.after(200, lambda: self.ensure_thumbnail_selection(page_number))
+            return
+            
+        if len(self.thumbnails) <= page_number or not hasattr(self, 'thumbnail_canvas') or not self.thumbnail_canvas.winfo_exists():
+            # If thumbnails aren't ready yet, retry after a short delay
+            self.root.after(200, lambda: self.ensure_thumbnail_selection(page_number))
+        else:
+            try:
+                # Check if thumb_color exists and has enough items
+                global thumb_color
+                if 'thumb_color' not in globals() or len(thumb_color) <= page_number:
+                    self.root.after(200, lambda: self.ensure_thumbnail_selection(page_number))
+                    return
+                    
+                # Track attempts to avoid infinite loops
+                if not hasattr(self, '_selection_attempts'):
+                    self._selection_attempts = 0
+                
+                # If too many attempts, ensure we don't get stuck
+                if self._selection_attempts > 10:
+                    self._selection_attempts = 0
+                    return
+                    
+                self._selection_attempts += 1
+                self._timed_thumbnail_selection(page_number)
+                self._selection_attempts = 0  # Reset on success
+                
+            except Exception as e:
+                print(f"Error in ensure_thumbnail_selection: {e}")
+                # Retry with increased delay if there was an error
+                self.root.after(300, lambda: self.ensure_thumbnail_selection(page_number))
+
+    def _timed_thumbnail_selection(self, page):
+        start_time = time.time()
+        self.update_thumbnail_selection(page)
+        end_time = time.time()
+        print(f"_timed_thumbnail_selection execution time: {end_time - start_time:.4f} seconds")
+
+    def _timed_render_thumbnails(self):
+        start_time = time.time()
+        self.render_thumbnails()
+        end_time = time.time()
+        print(f"render_thumbnails execution time: {end_time - start_time:.4f} seconds")
+    
+    # load pdf from the server and local 
+    def load_pdf(self, file_path=None):
+        """Load a PDF file from the specified path or URL."""
+        if not file_path:
+            file_path = filedialog.askopenfilename(filetypes=[("PDF files", "*.pdf")])
+        if not file_path:
+            print("No file selected")
+            return
+
+        print(f"Loading PDF from: {file_path}")
+
+        # Reset editor states
+        self.sticky_notes.clear()
+        self.canvas.delete("sticky_note")
+        self.zoom_factor = 1.0
+        self.stickynotezoomy = 1.0
+        self.page_rotation = 0
+        self.time_redact_used = 0
+        self.sticky_note_mode = False
+        self.highlight_mode = False
+        if "Temp" in file_path:
+            self.istempfile = True
+        else:
+            self.istempfile = False
+        self.annotations = []
+        self.change_history = []
+        self.change_redact_history = []
+        try:
+            sql_check = """
+                SELECT * FROM pdf_editor_details 
+                WHERE folder_path = %s
+            """
+            print("doc id----------------",self.doc_id)
+            mycursor.execute(sql_check, (self.doc_id))
+            result = mycursor.fetchone()
+            print("result----------------",result,"----",result[0])
+            if result[0] > 0:
+                print("records found in the database.",result,"----",result[0])
+        except:
+            print("No record in the database.")
+        self.annotation_listed = []
+        self.sticky_notes = {}
+        self.thumbnails = []
+        self.lines = []  # Store line annotations
+        self.arrows = []  # Store arrow annotations
+        self.rectangles = []
+        self.thumbnail_labels = []  # Initialize the missing attribute
+        self.thumbnail_cache = {}
+        self.freehand_drawings = []
+        self.redactions = []  # To store redaction info (coordinates)
+        self.redo_redactions = []
+        self.image_overlays = [] # To store image overlay info (coordinates)
+        self.text_annotations = {}
+        self.text_annotations_bg = {}
+        self.page_drawings = {}
+        self.polygons = []
+        self.rendered_page_count = 0
+        self.is_drawing_hollow_rect = False
+        self.is_drawing_filled_rect = False
+        self.is_drawing_hollow_circle = False
+        self.is_drawing_filled_circle = False
+        self.current_rectangle = None
+        self.rectangle_id = None
+        self.lock_screen = "no"
+        self.annotation_is_available = False
+        self.redact_is_available = False
+        self.load_pdf_url = file_path
+        print("load pdf url==============================================",self.load_pdf_url)
+        global decoded_url
+        try:
+            parsed = urlparse(file_path)
+            if parsed.scheme in ("http", "https"):
+                print("Downloading PDF from URL...")
+                pdf_data = None
+                try:
+                    response = requests.get(file_path)
+                    response.raise_for_status()
+                    pdf_data = response.content
+                    print("tttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttt")
+                except requests.exceptions.SSLError:
+                    try:
+                        print("SSL Error: Retrying without SSL verification...")
+                        response = requests.get(file_path, verify=False)
+                        response.raise_for_status()
+                        pdf_data = response.content
+                    except Exception as ssl_error:
+                        print(f"Failed to load PDF due to SSL issue: {ssl_error}")
+
+                if pdf_data:
+                    print("pdpdpdpdppdpdpdpdpdpdpdpdppdpdpdpdpdpdpdppdpdpdpdppdpdppdpdpdpdp")
+                    self.pdf_document = fitz.open(stream=pdf_data, filetype="pdf")
+                else:
+                    print("SSL verification failed, attempting to load from decoded URL...")
+                    decoded_url = unquote(file_path)
+                    print(f"Decoded URL: {decoded_url}")
+                    response = requests.get(decoded_url, verify=False)
+                    response.raise_for_status()
+                    self.pdf_document = fitz.open(stream=response.content, filetype="pdf")
+
+            elif os.path.exists(file_path):  # Local file handling
+                print("Opening local PDF...")
+                self.pdf_document = fitz.open(file_path)
+            else:
+                print("Invalid file path or URL.")
+                return
+
+            if len(self.pdf_document) == 0:
+                raise ValueError("The PDF has no pages.")
+
+            global fileurl
+            fileurl = file_path
+            self.pdf_path = file_path
+            self.current_page = int(self.pagenumber_url) - 1 if self.pagenumber_url is not None else 0
+            self.pagenumber_url = None
+            self.page_drawings = {}
+            # Store the target page for later thumbnail selection
+            self._target_page_after_load = self.current_page
+            # Initialize scroll tracking variables
+            self.last_scroll_position = 0
+            self._scroll_reset_job = None
+            self.is_inverted = False
+            self.text_annotations.clear()
+            self.text_annotations_bg.clear()
+            first_page = self.pdf_document[self.current_page]
+            self.page_width, self.page_height = first_page.rect.width, first_page.rect.height
+            print(f"Page Width: {self.page_width}, Page Height: {self.page_height}")
+            global is_small_page
+            if self.page_width < 1000:
+                is_small_page = "yes"
+            elif 2000 < self.page_width < 3000 and self.page_height > 2800:
+                is_small_page = "longer"
+            elif 1000 <= self.page_width < 2500:
+                is_small_page = "slightly"
+            elif 2500 <= self.page_width < 3000:
+                is_small_page = "maybe"
+            elif 3000 <= self.page_width < 5000:
+                is_small_page = "nope large"
+            elif self.page_width >= 10000:
+                is_small_page = "nope very large"
+            else:
+                is_small_page = "no"
+
+            print("page--------------------------------", is_small_page)
+            # self.render_thumbnails()
+            # self.render_page(self.current_page)
+            # self.root.after(500, lambda: self.update_thumbnail_selection(self.current_page))
+            # # try:
+            # #     self.root.after(500, lambda: self.best_fit)
+            # # except Exception as e:
+            # #     print("Error in best_fit:", e)
+            # print("load_pdf running ---",self.loaderurl)
+                  
+            # response = requests.get(self.loaderurl, timeout=2)
+            self.root.after(0, lambda: self._timed_render_page(self.current_page))
+            self.root.after(0, lambda: self._timed_render_thumbnails())
+            print("----------------------------------------------------------------------------------------------------------------------------------------------")
+            self.root.after(800, lambda: self.ensure_thumbnail_selection(self._target_page_after_load))
+            self.update_page_display()
+            
+            
+        except Exception as e:
+            print(f"Failed to load PDF: {e}")
+            messagebox.showerror("Error", f"Failed to load PDF: 400 Bad URL Request")
+            self.pdf_document = None
+            self.current_page = None 
+        decoded_url = unquote(self.pdf_file_url)
+        print(f"Loaded PDF decoded: {decoded_url}")
+        global filename_pdf
+        global edit_file_name
+        global annotated_url
+        global annotatedredact_url
+        global redacted_name
+        global beforeexe
+        try:
+            filename_pdf = decoded_url.split('/')[-1]
+        except:
+            filename_pdf = decoded_url.split('\\')[-1]
+        beforeexe = filename_pdf.rsplit('.pdf', 1)[0]
+        print("filename_pdf------------------",filename_pdf)
+        print("beforeexe------------------",beforeexe)
+        if "_redact.pdf" in decoded_url:
+            edit_file_name = beforeexe +".pdf"
+            redacted_name = beforeexe + ".pdf"
+            annotatedredact_url = decoded_url.replace('.pdf', '_with_annotations.pdf')
+            annotated_url = decoded_url.replace('_redact.pdf', '_with_annotations.pdf')
+
+        elif "redact_with_annotations.pdf" in decoded_url:
+            annotated_url = decoded_url.replace('_redact_with_annotations.pdf', '_with_annotations.pdf')
+            annotatedredact_url = decoded_url
+            redacted_name = annotatedredact_url
+            edit_file_name = beforeexe + ".pdf"
+            print("suppperrrrrrr")
+
+        elif "_with_annotations.pdf" in decoded_url:
+            annotated_url = decoded_url
+            annotatedredact_url = decoded_url.replace('_with_annotations.pdf','_redact_with_annotations.pdf')
+            edit_file_name = beforeexe + ".pdf"
+            redacted_name = annotatedredact_url
+            print("suppperrrrrrr")
+
+        else:
+            annotated_url = decoded_url.replace('.pdf', '_with_annotations.pdf')
+            annotatedredact_url = decoded_url.replace('.pdf', '_redact_with_annotations.pdf')
+            redacted_name = decoded_url.replace('.pdf', '_redact.pdf')
+            edit_file_name = beforeexe + ".pdf"
+            print("else haiii")
+         # Update page number display
+
+        
+        print("------------------------------------------------------------------------------------------------------------------------------------------")
+        print("file_path-------",file_path)
+        print("------------------------------------------------------------------------------------------------------------------------------------------")
+        print("editedfilename_pdf-------",edit_file_name)
+        print("------------------------------------------------------------------------------------------------------------------------------------------")
+        print("annotated_url*****************",annotated_url)
+        print("------------------------------------------------------------------------------------------------------------------------------------------")
+        print("annotatedredact_url ------------------------",annotatedredact_url)
+        print("------------------------------------------------------------------------------------------------------------------------------------------")
+        print("redacted_name ------------------------",redacted_name)
+        print("------------------------------------------------------------------------------------------------------------------------------------------")
+        print("beforeexe ------------------------",beforeexe)
+        print("------------------------------------------------------------------------------------------------------------------------------------------")
+        print("filename_pdf ------------------------",filename_pdf)
+        print("------------------------------------------------------------------------------------------------------------------------------------------")
+##########################################################################################################################################################################################
+
+    def render_thumbnails(self):
+        """
+        Render thumbnails for all pages in the PDF document efficiently.
+        Ensures all pages are rendered correctly, even in large PDFs.
+        """
+        if not self.pdf_document:
+            print("No PDF document loaded for thumbnails.")
+            return
+        
+        # Clear existing thumbnails
+        for widget in self.inner_thumbnail_frame.winfo_children():
+            widget.destroy()
+        
+        global thumb_color
+        thumb_color = []
+        self.thumbnails = []  # Reset thumbnails list
+        
+        thumbnail_width = 100
+        thumbnail_height = 150
+        total_pages = len(self.pdf_document)
+        
+        # Track when thumbnails are fully rendered
+        self._thumbnails_rendering = True
+        
+        def batch_load_thumbnails(start_page, batch_size=10):
+            """Load thumbnails in batches to improve performance and UI responsiveness."""
+            end_page = min(start_page + batch_size, total_pages)
+            for page_number in range(start_page, end_page):
+                if page_number in self.thumbnail_cache:
+                    # For cached thumbnails, add immediately
+                    self.inner_thumbnail_frame.after(0, lambda p=page_number, ph=self.thumbnail_cache[page_number]: 
+                                                    add_thumbnail(p, ph))
+                    continue  # Skip already cached thumbnails
+                
+                try:
+                    page = self.pdf_document.load_page(page_number)
+                    pix = page.get_pixmap(matrix=fitz.Matrix(0.5, 0.5))  # Scale down
+                    img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+                    img.thumbnail((thumbnail_width, thumbnail_height), Image.LANCZOS)
+                    photo = ImageTk.PhotoImage(img)
+                    self.thumbnail_cache[page_number] = photo
+                    self.inner_thumbnail_frame.after(0, lambda p=page_number, ph=photo: add_thumbnail(p, ph))
+                except Exception as e:
+                    print(f"Error rendering thumbnail for page {page_number}: {e}")
+            
+            if end_page < total_pages:
+                # Continue with next batch
+                self.inner_thumbnail_frame.after(100, lambda: batch_load_thumbnails(end_page))
+            else:
+                # All thumbnails loaded
+                self._thumbnails_rendering = False
+                self.inner_thumbnail_frame.after(500, self.update_scroll_region)
+                
+                # Don't reset scroll position to top when done - let selection handle it
+                if hasattr(self, '_target_page_after_load') and self._target_page_after_load > 0:
+                    # Let selection handle scrolling
+                    pass
+        
+        def add_thumbnail(page_number, photo):
+            """Add a rendered thumbnail to the UI with a proper layout (grid for large PDFs)."""
+            label = ctk.CTkLabel(self.inner_thumbnail_frame, image=photo, text=f"Page {page_number + 1}")
+            label.image = photo  # Keep reference
+            
+            if total_pages > 50:
+                row = page_number // 2  # Arrange in a grid (2 columns)
+                col = page_number % 2
+                label.grid(row=row, column=col, padx=5, pady=5, sticky="w")
+            else:
+                label.pack(pady=5, padx=45)
+            
+            label.bind("<Button-1>", self.create_page_selection_handler(page_number))
+            self.thumbnails.append(label)
+            thumb_color.append(label)
+        
+        # Start loading thumbnails
+        batch_load_thumbnails(0)
+
+######################################################################################################################################################################################################################
+    # to pass the page number to the selected page
+    def create_page_selection_handler(self, page_number):
+        """Return a handler function to navigate to the selected page."""
+        def handler(event):
+            print(f"Thumbnail {page_number} clicked.")  # Debug log
+            self.select_page(page_number)
+        return handler
+    
+    # to render the page on the canvas and highlight the selected page
+    # def update_thumbnail_selection(self,page_number):
+    #     """Update the highlight of the selected thumbnail."""
+    #     # print("Updating thumbnail selection...",self.thumbnails)  # Debug log
+    #     print("page number of thumbnail-------------------------------------------------",page_number)
+    #     self.root.deiconify()  # Restore the window if it is minimized
+    #     self.root.lift()  # Bring the window to the front
+    #     self.root.focus_force()  # Ensure it gets focus
+    #     self.root.attributes("-topmost", True)  # Set the window to always be on top
+    #     self.root.after(500, lambda: self.root.attributes("-topmost", False))
+    #     for label in thumb_color:
+    #         label.configure(text=f"Page {thumb_color.index(label) + 1}",text_color="black")
+    #         if hasattr(label, "original_image"):
+    #             label.configure(image=label.original_image)
+    #     # Update selected thumbnail
+    #     selected_label = thumb_color[page_number]
+    #     selected_label.configure(text="Selected Page",text_color="red")
+    #     self.inner_thumbnail_frame.update_idletasks()
+
+    def update_thumbnail_selection(self, page_number):
+        """Update the highlight of the selected thumbnail and ensure it's visible in the scroll view."""
+        self.root.deiconify()  # Restore the window if it is minimized
+        self.root.lift()  # Bring the window to the front
+        self.root.focus_force()  # Ensure it gets focus
+        self.root.attributes("-topmost", True)  # Set the window to always be on top
+        self.root.after(500, lambda: self.root.attributes("-topmost", False))
+        
+        # Reset all thumbnails to their default state
+        for label in thumb_color:
+            label.configure(
+                text=f"Page {thumb_color.index(label) + 1}",
+                text_color="black",
+                fg_color="transparent",  # Reset background color
+                corner_radius=0  # Reset corner radius
+            )
+            if hasattr(label, "original_image"):
+                label.configure(image=label.original_image)
+        
+        # Make sure we have a valid page number
+        if 0 <= page_number < len(thumb_color):
+            selected_label = thumb_color[page_number]
+            
+            # Configure the selected thumbnail with highlighting that's supported by CTkLabel
+            selected_label.configure(
+                text="Selected Page",      # Change text to "Selected Page"
+                text_color="red",        # White text for better contrast
+                fg_color="#c41818",        # Red background for highlighting
+                corner_radius=4,           # More pronounced corner radius
+                compound="center"          # Ensure the text and image are centered
+            )
+            
+            # Update layout before scrolling
+            self.inner_thumbnail_frame.update_idletasks()
+
+            self.selected_label_info = selected_label
+            
+            # Now scroll the thumbnail view to make the selected thumbnail visible
+            self.root.after(100, lambda: self.scroll_to_thumbnail(selected_label, page_number))
+
+    # to render the selected page on the canvas
+    def select_page(self, page_number):
+        """Handle thumbnail click event to switch pages."""
+        if 0 <= page_number < len(self.pdf_document):
+            self.current_page = page_number
+            self.render_page(self.current_page)
+            self.update_page_display() # Update page number display
+            self.update_thumbnail_selection(page_number) # Highlight selected thumbnail
+
+    # to render the page on the duplicate canvas
+    def create_duplicate_window(self, fileurl):
+        """Creates a duplicate window to display a PDF independently."""
+        if not self.pdf_document or self.current_page is None:
+            messagebox.showerror("Error", "No PDF loaded.")
+            return
+        if not fileurl:
+            messagebox.showerror("Error", "No PDF is currently loaded to duplicate.")
+            return
+
+        duplicate_root = ctk.CTkToplevel(self.root) 
+        duplicate_window = DuplicateStickyNotesPDFApp(duplicate_root, fileurl)
+        self.duplicate_windows.append(duplicate_root) # Keep track of duplicate windows
+
+        def on_close():
+            self.duplicate_windows.remove(duplicate_root)
+            duplicate_root.destroy()
+
+        duplicate_root.protocol("WM_DELETE_WINDOW", on_close)
+    # close only when all the duplicate window are closed
+    def close_main_window(self):
+        """Closes the main window only if there are no duplicate windows open."""
+        if self.duplicate_windows:
+            messagebox.showerror("Warning", "Please close all duplicate windows before exiting the main window.")
+        else:
+            self.root.destroy()
+
+    def lock_function(self):
+        self.lock_screen = "yes" if self.lock_screen == "no" else "no"
+        current_page_number = self.current_page
+        current_pdf = self.pdf_document
+
+        # Destroy all widgets safely
+        for widget in self.root.winfo_children():
+            widget.destroy()
+
+        # Reset widget references before re-creating
+        self.canvas = None
+        self.thumbnail_canvas = None
+        self.thumbnail_frame = None
+        self.inner_thumbnail_frame = None
+        self.thumbnail_labels = []
+        self.thumbnails = []
+        self.thumbnail_cache = {}
+
+        # Re-create all widgets
+        self.create_widgets()
+
+        # Restore the PDF and page view
+        if current_pdf and current_page_number is not None:
+            self.pdf_document = current_pdf
+            self.current_page = current_page_number
+
+            self.render_page(self.current_page)
+
+            # Delay thumbnail rendering slightly to ensure canvas is ready
+            self.root.after(150, self.render_thumbnails)
+
+            self.update_page_display()
+            self.root.after(1000, lambda: self.update_thumbnail_selection(self.current_page))
+
+            self.canvas.config(cursor="arrow")
+            self.canvas.bind("<Motion>", self.on_mouse_hover)
+            self.page_entry.delete(0, "end")
+            self.page_entry.insert(0, str(self.current_page + 1))
+            self.page_total_label.configure(text=f"/ {len(self.pdf_document)}")
+
+    # increase the page size by .2 ever time.
+    def zoom_in(self):
+        if not self.pdf_document or self.current_page is None:
+            messagebox.showerror("Error", "No PDF loaded.")
+            return
+        self.zoom_factor += 0.2
+        self.render_page(self.current_page)
+    # decrease the page size by .2 ever time.    
+    def zoom_out(self):
+        if not self.pdf_document or self.current_page is None:
+            messagebox.showerror("Error", "No PDF loaded.")
+            return
+        if self.zoom_factor > 0.4:
+            self.zoom_factor -= 0.2
+            self.render_page(self.current_page)
+    # to render the page in perfect fit in width or height to see all the content
+    def best_fit(self):
+        """Adjust the zoom level to fit the entire PDF page within the canvas."""
+        if not self.pdf_document or self.current_page is None:
+            messagebox.showerror("Error", "No PDF loaded.")
+            return
+
+        canvas_width = self.canvas.winfo_width()
+        canvas_height = self.canvas.winfo_height()
+
+        page = self.pdf_document.load_page(self.current_page)
+        page_width, page_height = page.rect.width, page.rect.height
+
+        width_scale = canvas_width / page_width
+        height_scale = canvas_height / page_height
+        self.zoom_factor = min(width_scale, height_scale)
+
+        self.render_page(self.current_page)
+    # to show the page number entered in the entry box
+    def go_to_page(self, event=None):
+        try:
+            page_number = int(self.page_entry.get()) - 1  # Convert to zero-based index
+            if 0 <= page_number < len(self.pdf_document):
+                self.current_page = page_number
+                self.render_page(self.current_page)
+                self.update_thumbnail_selection(self.current_page)
+            else:
+                messagebox.showerror("Error", "Invalid page number.")
+        except ValueError:
+            messagebox.showerror("Error", "Enter a valid page number.")
+
+    def scroll_to_thumbnail(self, selected_label, page_number):
+        """Scroll the thumbnail view to make the selected thumbnail visible."""
+        if not hasattr(selected_label, 'winfo_y'):
+            return
+        total_pages = len(self.pdf_document) if self.pdf_document else 0
+        if total_pages > 50:  # Grid layout
+            row = page_number // 2
+            y_position = row * (150 + 10)  # thumbnail_height + padding
+        else:  # Pack layout
+            y_position = selected_label.winfo_y()
+        
+        canvas_height = self.thumbnail_canvas.winfo_height()
+        scroll_region = self.thumbnail_canvas.bbox("all")
+        if not scroll_region:
+            return
+        total_height = scroll_region[3] - scroll_region[1]
+        if total_height <= 0:
+            return
+        
+        # Calculate the target scroll position
+        fraction = y_position / total_height
+        half_thumbnail = 75  # Half of thumbnail height
+        half_canvas = canvas_height / 2
+        offset = (half_canvas - half_thumbnail) / total_height
+        fraction = max(0.0, min(1.0, fraction - offset))
+        
+        # Update scroll position and prevent bouncing back
+        self.thumbnail_canvas.yview_moveto(fraction)
+        
+        # Store the target position to prevent bouncing back to top
+        self.last_scroll_position = fraction
+        
+        # Cancel any pending scroll reset operations
+        if hasattr(self, '_scroll_reset_job') and self._scroll_reset_job:
+            self.root.after_cancel(self._scroll_reset_job)
+            self._scroll_reset_job = None
+            
+        # Add a second validation to ensure scroll position maintains after layout updates
+        self._scroll_reset_job = self.root.after(250, lambda: self._ensure_scroll_position(fraction))
+    
+    def _ensure_scroll_position(self, target_position):
+        """Ensures the thumbnail scroll position stays at the desired location.
+        This prevents the scroll from bouncing back to the top after being set."""
+        current_position = self.thumbnail_scrollbar.get()[0]  # Get current scroll position
+        
+        # If the position has changed significantly, reset it to our target
+        if abs(current_position - target_position) > 0.05:  # Allow small variations
+            self.thumbnail_canvas.yview_moveto(target_position)
+            
+            # Schedule another check to make sure it sticks
+            self._scroll_reset_job = self.root.after(200, lambda: self._ensure_scroll_position(target_position))
+        else:
+            self._scroll_reset_job = None
+
+
+    # to remove all the changes by reloading the url again
+    def refresh(self):
+        """
+        Prompts the user to save the file and reloads the PDF if confirmed.
+        If the user declines, nothing happens.
+        """
+        if not self.pdf_document or self.current_page is None:
+            messagebox.showerror("Error", "No PDF loaded.")
+            return
+        # self.thumbnails_rendered = False
+        
+        response = messagebox.askyesnocancel("Confirm", "Would you like to save the file before refreshing? Any unsaved changes will be permanently lost.")
+        if response is None:
+            return
+        elif response:
+            try:
+                self.save_pdf()
+                self.load_pdf(self.load_pdf_url)
+            except Exception as e:
+                print(f"Error saving PDF before refresh: {e}")
+        else:
+            # User clicked 'No', just refresh without saving
+            self.load_pdf(self.load_pdf_url)
+
+    # if a file related to the url is saved after change to show when clicked if it 
+    # has redacted it shows redacted as pirority even if annoted file is also saved
+    def show_annotated_file(self):
+        """Toggle the visibility of annotations on the canvas."""
+        if not self.pdf_document or self.current_page is None:
+            messagebox.showerror("Error", "No PDF loaded.")
+            return
+        # self.show_annotated_file = True
+        response = messagebox.askyesno(
+            "Confirm",
+            "Are you sure you want to view if this page has annotations? Any unsaved changes will be lost."
+        )
+        if not response:
+            return
+        for url in [annotatedredact_url, annotated_url,redacted_name]:
+            if url:
+                try:
+                    parsed = urlparse(url)
+                    if parsed.scheme in ('http', 'https'):
+                        try:
+                            response = requests.head(url, allow_redirects=True, timeout=5)
+                            if response.status_code == 200 and 'application/pdf' in response.headers.get('Content-Type', ''):
+                                self.load_pdf(url)
+                                return
+                        except requests.RequestException:
+                            continue
+                    elif os.path.isfile(url) and url.lower().endswith('.pdf'):
+                        self.load_pdf(url)
+                        return
+                except Exception:
+                    continue
+
+        messagebox.showinfo("Info", "No Annotation were saved to view.")
+
+    # to show the width in perfect width to see all the content as per window width
+    def best_width(self):
+        """Adjust the zoom level to fit the entire PDF page to the canvas width."""
+        if not self.pdf_document or self.current_page is None:
+            messagebox.showerror("Error", "No PDF loaded.")
+            return
+
+        canvas_width = self.canvas.winfo_width()
+        page = self.pdf_document.load_page(self.current_page)
+        page_width = page.rect.width
+
+        self.zoom_factor = canvas_width / page_width
+        self.render_page(self.current_page)
+
+    # to show the height in perfect height to see all the content as per window height
+    def best_height(self):
+        """Adjust the zoom level to fit the entire PDF page to the canvas height."""
+        if not self.pdf_document or self.current_page is None:
+            messagebox.showerror("Error", "No PDF loaded.")
+            return
+
+        canvas_height = self.canvas.winfo_height()
+        page = self.pdf_document.load_page(self.current_page)
+        page_height = page.rect.height
+
+        self.zoom_factor = canvas_height / page_height
+        self.render_page(self.current_page)
+
+    # to show all the changes done on the pdf by render the pdf after each change.
+    # def render_page(self, page_number):
+    #     """Render a PDF page to the canvas with the current zoom factor."""
+    #     if not self.pdf_document:
+    #         messagebox.showerror("Error", "No PDF loaded.")
+    #         return
+
+    #     global pageinfo
+    #     pageinfo = page_number
+    #     page = self.pdf_document.load_page(page_number)
+    #     print("page_number - ", page_number)
+
+    #     matrix = fitz.Matrix(self.zoom_factor, self.zoom_factor)
+    #     pix = page.get_pixmap(matrix=matrix)
+
+    #     try:
+    #         img = Image.open(io.BytesIO(pix.tobytes("png")))
+    #     except Image.DecompressionBombError:
+    #         print("[WARNING] DecompressionBombError caught. Resizing large image...")
+    #         try:
+    #             # Fallback: Resize the image to be within limits
+    #             img = Image.open(io.BytesIO(pix.tobytes("png")))
+    #             max_pixels = 178956970
+    #             current_pixels = pix.width * pix.height
+
+    #             scale_factor = (max_pixels / current_pixels) ** 0.5
+    #             new_width = int(pix.width * scale_factor)
+    #             new_height = int(pix.height * scale_factor)
+
+    #             print(f"[INFO] Resizing image from ({pix.width}, {pix.height}) to ({new_width}, {new_height})")
+
+    #             img = img.resize((new_width, new_height), Image.LANCZOS)
+
+    #         except Exception as e:
+    #             print(f"[ERROR] Failed to resize and open large image: {e}")
+    #             messagebox.showerror("Image Error", "Failed to process a very large page image.")
+    #             return
+    #     except Exception as e:
+    #         print(f"[ERROR] Unexpected image load error: {e}")
+    #         messagebox.showerror("Image Error", "An error occurred while rendering the page.")
+    #         return
+
+    #     if self.is_inverted:
+    #         img = ImageOps.invert(img.convert("RGB"))
+
+    #     img_tk = ImageTk.PhotoImage(img)
+    #     self.canvas.delete("all")
+    #     self.canvas.create_image(0, 0, anchor="nw", image=img_tk)
+    #     self.canvas.img_tk = img_tk  # Prevent garbage collection
+
+    #     self.page_width, self.page_height = img.width, img.height
+    #     self.canvas.configure(scrollregion=(0, 0, self.page_width, self.page_height))
+    #     print("-----------------------------------------------------------------------------------------------")
+    #     print("self.rendered_page_count--",self.rendered_page_count)
+    #     print("-----------------------------------------------------------------------------------------------")
+
+    #     if self.rendered_page_count == 0:
+    #         print("Loading PDF in a separate thread...")
+    #         threading.Thread(target=self._load_pdf_internal, args=(self.load_pdf_url,), daemon=True).start()
+    #         print("PDF loaded in a separate thread.")
+    #         self.rendered_page_count += 1
+    #     # Redraw sticky notes    
+    #     self.redraw_sticky_notes()
+    #     self.redraw_text_annotations()
+    #     self.redraw_text_with_background()
+    #     self.redraw_polygons()
+    #     self.redraw_all_annotations()
+    #     self.redraw_image_overlays(page_number)
+    #     self.redraw_freehand_drawings()
+    #     self.canvas.config(scrollregion=self.canvas.bbox("all"))
+    #     print("self.duplicate_windows list -",self.duplicate_windows)
+
+
+    def render_page(self, page_number):
+        """Render a PDF page to the canvas with the current zoom factor."""
+        if not self.pdf_document:
+            messagebox.showerror("Error", "No PDF loaded.")
+            return
+        global pageinfo
+        pageinfo = page_number
+        page = self.pdf_document.load_page(page_number)
+        print("page_number - ",page_number)
+        matrix = fitz.Matrix(self.zoom_factor, self.zoom_factor)
+        pix = page.get_pixmap(matrix=matrix)
+        img = Image.open(io.BytesIO(pix.tobytes("png")))
+        # Apply inversion if needed
+        if self.is_inverted:
+            img = ImageOps.invert(img.convert("RGB"))
+        # Convert to a format suitable for display
+        img_tk = ImageTk.PhotoImage(img)
+        # Clear and redraw the canvas
+        self.canvas.delete("all")
+        self.canvas.create_image(0, 0, anchor="nw", image=img_tk)
+        self.canvas.img_tk = img_tk  # Keep a reference to prevent garbage collection
+        # Update scrollable region
+        self.page_width, self.page_height = pix.width, pix.height
+        self.canvas.configure(scrollregion=(0, 0, self.page_width, self.page_height))
+        if self.rendered_page_count == 0:
+            self.root.after(100, self.ensure_best_fit)
+            self.rendered_page_count += 1
+        # Redraw sticky notes     
+        self.redraw_sticky_notes()
+        self.redraw_text_annotations()
+        self.redraw_text_with_background()
+        self.redraw_polygons()
+        self.redraw_all_annotations()
+        self.redraw_image_overlays(page_number)
+        self.redraw_freehand_drawings()
+        self.canvas.config(scrollregion=self.canvas.bbox("all"))
+        print("self.duplicate_windows list -",self.duplicate_windows)
+
+    # def redraw_image_overlays(self, page_number):
+    #     """Redraw image overlays for the current page with proper scaling."""
+    #     if not hasattr(self, "image_overlays"):
+    #         self.image_overlays = []
+    #         return
+            
+    #     # Clear existing image overlays from canvas
+    #     self.canvas.delete("image_overlay")
+    #     self.tk_images = {}  # Reset the tk_images dictionary
+        
+    #     current_page_overlays = [overlay for overlay in self.image_overlays if overlay["page"] == page_number]
+        
+    #     for overlay in current_page_overlays:
+    #         try:
+    #             # Get the base coordinates and size
+    #             base_x = overlay["base_x"]
+    #             base_y = overlay["base_y"]
+    #             base_width = overlay["base_width"]
+    #             base_height = overlay["base_height"]
+                
+    #             # Apply zoom factor to coordinates and dimensions
+    #             scaled_x = base_x * self.zoom_factor
+    #             scaled_y = base_y * self.zoom_factor
+    #             scaled_width = base_width * self.zoom_factor
+    #             scaled_height = base_height * self.zoom_factor
+                
+    #             # Update overlay with scaled values for reference
+    #             overlay["x"] = scaled_x
+    #             overlay["y"] = scaled_y
+    #             overlay["width"] = scaled_width
+    #             overlay["height"] = scaled_height
+                
+    #             # Resize and display the image
+    #             img = Image.open(overlay["image_path"])
+    #             img = img.resize((int(scaled_width), int(scaled_height)), Image.LANCZOS)
+    #             tk_img = ImageTk.PhotoImage(img)
+    #             self.tk_images[overlay["id"]] = tk_img
+                
+    #             canvas_id = self.canvas.create_image(
+    #                 scaled_x, scaled_y,
+    #                 image=tk_img,
+    #                 anchor="nw",
+    #                 tags=("image_overlay", overlay["id"]))
+    #             overlay["canvas_id"] = canvas_id
+                
+    #         except Exception as e:
+    #             print(f"Failed to redraw image overlay: {e}")
+
+    def redraw_image_overlays(self, page_number):
+        """Redraw image overlays for the current page with proper scaling and rotation."""
+        if not hasattr(self, "image_overlays"):
+            self.image_overlays = []
+            return
+        self.canvas.delete("image_overlay")
+        self.tk_images = {}  # Reset the tk_images dictionary
+        
+        rotation_angle = 0
+        if self.pdf_document:
+            page = self.pdf_document[page_number]
+            rotation_angle = page.rotation
+        
+        page_width = self.page_width
+        page_height = self.page_height
+        
+        current_page_overlays = [overlay for overlay in self.image_overlays if overlay["page"] == page_number]
+        
+        for overlay in current_page_overlays:
+            try:
+                # Get base coordinates and dimensions (unscaled)
+                base_x = overlay["base_x"]
+                base_y = overlay["base_y"]
+                base_width = overlay["base_width"]
+                base_height = overlay["base_height"]
+                
+                # Apply zoom scaling
+                scaled_x = base_x * self.zoom_factor
+                scaled_y = base_y * self.zoom_factor
+                scaled_width = base_width * self.zoom_factor
+                scaled_height = base_height * self.zoom_factor
+                
+                # Apply rotation transformation
+                # For proper positioning, we need to rotate coordinates based on rotation angle
+                if rotation_angle == 0:
+                    rotated_x, rotated_y = scaled_x, scaled_y
+                    display_width, display_height = scaled_width, scaled_height
+                else:
+                    # For rotations, we need to handle the center point of the image
+                    # Calculate the position from the center of the original image
+                    center_x_orig = scaled_x + (scaled_width / 2)
+                    center_y_orig = scaled_y + (scaled_height / 2)
+                    
+                    # Use rotate_point to get the rotated position
+                    rotated_center_x, rotated_center_y = self.rotate_point(
+                        center_x_orig, center_y_orig, 
+                        page_width, page_height, 
+                        rotation_angle)
+                    
+                    # Swap dimensions for 90° and 270° rotations
+                    if rotation_angle in [90, 270]:
+                        display_width, display_height = scaled_height, scaled_width
+                    else:
+                        display_width, display_height = scaled_width, scaled_height
+                    
+                    # Calculate the top-left corner from the center point
+                    rotated_x = rotated_center_x - (display_width / 2)
+                    rotated_y = rotated_center_y - (display_height / 2)
+                
+                # Update overlay with new coordinates
+                overlay["x"] = rotated_x
+                overlay["y"] = rotated_y
+                overlay["width"] = display_width
+                overlay["height"] = display_height
+                
+                # Load and prepare the image
+                img = Image.open(overlay["image_path"])
+                
+                # Rotate the image if needed
+                if rotation_angle != 0:
+                    pil_rotation = {
+                        90: 270,  # PIL uses counter-clockwise rotation
+                        180: 180,
+                        270: 90
+                    }.get(rotation_angle, 0)
+                    img = img.rotate(pil_rotation, expand=True)
+                
+                # Resize the image
+                img = img.resize((int(display_width), int(display_height)), Image.LANCZOS)
+                
+                # Convert to Tkinter PhotoImage
+                tk_img = ImageTk.PhotoImage(img)
+                self.tk_images[overlay["id"]] = tk_img
+                
+                # Create the image on canvas
+                canvas_id = self.canvas.create_image(
+                    rotated_x, rotated_y,
+                    image=tk_img,
+                    anchor="nw",
+                    tags=("image_overlay", overlay["id"]))
+                    
+                overlay["canvas_id"] = canvas_id
+                
+            except Exception as e:
+                print(f"Failed to redraw image overlay: {e}")
+
+    def redraw_all_annotations(self):
+        """Redraw all annotations on the current page with proper rotation"""
+        if not self.pdf_document:
+            return
+        page = self.pdf_document[self.current_page]
+        rotation_angle = page.rotation  # Get current page rotation
+        
+        self.redraw_lines(rotation_angle)
+        self.redraw_arrows(rotation_angle)
+        self.redraw_rectangles(rotation_angle)
+        self.redraw_ellipses(rotation_angle)
+
+    def redraw_lines(self, rotation_angle=0):
+        """Redraw all line annotations for the current page with rotation"""
+        self.canvas.delete("line")
+        page_width, page_height = self.page_width, self.page_height
+        
+        for annotation in self.lines:
+            if annotation['page'] == self.current_page:
+                # Apply zoom factor to coordinates
+                x1 = annotation['x1'] * self.zoom_factor
+                y1 = annotation['y1'] * self.zoom_factor
+                x2 = annotation['x2'] * self.zoom_factor
+                y2 = annotation['y2'] * self.zoom_factor
+                
+                # Apply rotation
+                x1, y1 = self.rotate_point(x1, y1, page_width, page_height, rotation_angle)
+                x2, y2 = self.rotate_point(x2, y2, page_width, page_height, rotation_angle)
+                
+                self.canvas.create_line(
+                    x1, y1, x2, y2,
+                    fill="red", width=3, tags=("annotation", "line"))
+
+    def redraw_arrows(self, rotation_angle=0):
+        """Redraw all arrow annotations for the current page with rotation"""
+        self.canvas.delete("arrow")
+        page_width, page_height = self.page_width, self.page_height
+        
+        for annotation in self.arrows:
+            if annotation['page'] == self.current_page:
+                # Apply zoom factor to coordinates
+                x1 = annotation['x1'] * self.zoom_factor
+                y1 = annotation['y1'] * self.zoom_factor
+                x2 = annotation['x2'] * self.zoom_factor
+                y2 = annotation['y2'] * self.zoom_factor
+                
+                # Apply rotation
+                x1, y1 = self.rotate_point(x1, y1, page_width, page_height, rotation_angle)
+                x2, y2 = self.rotate_point(x2, y2, page_width, page_height, rotation_angle)
+                
+                self.canvas.create_line(
+                    x1, y1, x2, y2,
+                    fill="red", width=3, arrow=ctk.LAST, 
+                    arrowshape=(16, 20, 6), tags=("annotation", "arrow"))
+
+    def redraw_rectangles(self, rotation_angle=0):
+        """Redraw all rectangle annotations for the current page with rotation"""
+        self.canvas.delete("rectangle")
+        page_width, page_height = self.page_width, self.page_height
+        
+        for annotation in self.rectangles:
+            print("annotation ------------------",annotation)
+            if annotation['page'] == self.current_page:
+                # Apply zoom factor to coordinates
+                x1 = annotation['x1'] * self.zoom_factor
+                y1 = annotation['y1'] * self.zoom_factor
+                x2 = annotation['x2'] * self.zoom_factor
+                y2 = annotation['y2'] * self.zoom_factor
+                
+                # For rectangles, we need to rotate all four corners
+                corners = [
+                    (x1, y1),
+                    (x2, y1),
+                    (x2, y2),
+                    (x1, y2)
+                ]
+                
+                # Rotate each corner
+                rotated_corners = []
+                for x, y in corners:
+                    rx, ry = self.rotate_point(x, y, page_width, page_height, rotation_angle)
+                    rotated_corners.extend([rx, ry])
+                
+                outline_color = annotation['color']
+                fill_color = "" if not annotation['filled'] else annotation['color']
+                
+                # Draw as polygon instead of rectangle to handle rotation
+                self.canvas.create_polygon(
+                    rotated_corners,
+                    outline=outline_color, fill=fill_color, 
+                    width=3, tags=("annotation", "rectangle"))
+
+    def redraw_ellipses(self, rotation_angle=0):
+        """Redraw all ellipse annotations on the current page with correct rotation"""
+        self.canvas.delete("ellipse")
+        
+        ellipse_annotations = [ann for ann in self.annotations 
+                            if isinstance(ann, tuple) and ann[0] == 'ellipse' 
+                            and ann[1] is not None]
+        
+        for annotation in ellipse_annotations:
+            _, x1, y1, x2, y2, _, mode,numb = annotation
+            if numb == self.current_page:    
+                # Apply zoom factor to coordinates
+                unscaled_x1, unscaled_y1 = x1, y1
+                unscaled_x2, unscaled_y2 = x2, y2
+                
+                # Scale coordinates
+                x1 = unscaled_x1 * self.zoom_factor
+                y1 = unscaled_y1 * self.zoom_factor
+                x2 = unscaled_x2 * self.zoom_factor
+                y2 = unscaled_y2 * self.zoom_factor
+                
+                # Determine the page dimensions at current zoom level
+                page_width = self.page_width / self.zoom_factor
+                page_height = self.page_height / self.zoom_factor
+                
+                # Calculate the four corners of the bounding box
+                corners = [
+                    (x1, y1),  # Top-left
+                    (x2, y1),  # Top-right
+                    (x2, y2),  # Bottom-right
+                    (x1, y2)   # Bottom-left
+                ]
+                
+                # Rotate each corner
+                rotated_corners = []
+                for corner_x, corner_y in corners:
+                    rx, ry = self.rotate_point(corner_x, corner_y, 
+                                            self.page_width, self.page_height, 
+                                            rotation_angle)
+                    rotated_corners.append((rx, ry))
+                
+                # Find bounding box of rotated corners
+                rotated_x_coords = [p[0] for p in rotated_corners]
+                rotated_y_coords = [p[1] for p in rotated_corners]
+                rotated_x1 = min(rotated_x_coords)
+                rotated_y1 = min(rotated_y_coords)
+                rotated_x2 = max(rotated_x_coords)
+                rotated_y2 = max(rotated_y_coords)
+                
+                # Generate ellipse points
+                num_points = 72
+                points = []
+                
+                # Calculate center and radii of the original ellipse
+                cx = (x1 + x2) / 2
+                cy = (y1 + y2) / 2
+                rx = abs(x2 - x1) / 2
+                ry = abs(y2 - y1) / 2
+                
+                # Generate points around the ellipse and rotate each point
+                for i in range(num_points):
+                    angle = 2 * math.pi * i / num_points
+                    point_x = cx + rx * math.cos(angle)
+                    point_y = cy + ry * math.sin(angle)
+                    
+                    # Rotate this point according to page rotation
+                    rotated_point_x, rotated_point_y = self.rotate_point(
+                        point_x, point_y, 
+                        self.page_width, self.page_height, 
+                        rotation_angle
+                    )
+                    points.extend([rotated_point_x, rotated_point_y])
+                
+                fill = "" if mode == "hollow" else "orange"
+                self.canvas.create_polygon(
+                    points,
+                    outline="orange", width=3, fill=fill,
+                    smooth=True, tags=("ellipse", "annotation"))
+
+
+    def rotate_point(self, x, y, page_width, page_height, rotation_angle):
+        """Rotate a point (x, y) based on the given rotation angle."""
+        if rotation_angle == 90:
+            if is_small_page == "yes":
+                rotated_x, rotated_y = self.page_height+(180*self.zoom_factor) - y, x
+            elif is_small_page == "slightly":
+                rotated_x, rotated_y = self.page_height+(1050*self.zoom_factor) - y, x
+            elif is_small_page == "maybe":
+                rotated_x, rotated_y = self.page_height+(750*self.zoom_factor) - y, x
+            elif is_small_page == "longer":
+                print("rhdttjfykfkyf buka buka")
+                rotated_x, rotated_y = self.page_height+(720*self.zoom_factor) - y, x
+            elif is_small_page == "nope large":
+                rotated_x, rotated_y = self.page_height+(1000*self.zoom_factor) - y, x
+            elif is_small_page == "nope very large":
+                rotated_x, rotated_y = self.page_height+(4300*self.zoom_factor) - y, x
+            else:
+                rotated_x, rotated_y = self.page_height+(2000*self.zoom_factor) - y, x
+        elif rotation_angle == 180:
+            rotated_x, rotated_y = page_width - x, page_height - y  
+        elif rotation_angle == 270:
+            if is_small_page == "yes":
+                rotated_x, rotated_y = y, self.page_width-(180*self.zoom_factor) - x
+            elif is_small_page == "slightly":
+                rotated_x, rotated_y =y, self.page_width-(1050*self.zoom_factor) - x
+            elif is_small_page == "longer":
+                rotated_x, rotated_y = y, self.page_width-(720*self.zoom_factor) - x
+            elif is_small_page == "maybe":
+                rotated_x, rotated_y = y, self.page_width-(750*self.zoom_factor) - x 
+            elif is_small_page == "nope large":
+                rotated_x, rotated_y = y, self.page_width-(1000*self.zoom_factor) - x
+            elif is_small_page == "nope very large":
+                rotated_x, rotated_y = y, self.page_width-(4300*self.zoom_factor) - x
+            else:
+                rotated_x, rotated_y = y, self.page_width-(2000*self.zoom_factor) - x 
+        else:  # 0 degrees
+            rotated_x, rotated_y = x, y  
+        return rotated_x, rotated_y
+
+    def redraw_polygons(self):
+        """Redraw all polygons, adjusting for zoom and rotation properly."""
+        if not self.pdf_document or self.current_page is None:
+            return
+
+        self.canvas.delete("polygon")
+        page = self.pdf_document[self.current_page]
+        rotation_angle = page.rotation  # Get current page rotation
+
+        if self.current_page not in self.page_drawings:
+            return
+
+        page_width, page_height = self.page_width, self.page_height  # Get current page dimensions
+
+        for mode, points, polygon_id in self.page_drawings[self.current_page]:
+            scaled_points = [coord * self.zoom_factor for coord in points]
+
+            rotated_points = []
+            for i in range(0, len(scaled_points), 2):
+                x, y = scaled_points[i], scaled_points[i + 1]
+                new_x, new_y = self.rotate_point(x, y, page_width, page_height, rotation_angle)
+                rotated_points.extend([new_x, new_y])
+
+            polygon_id = self.canvas.create_polygon(
+                rotated_points,
+                fill="blue" if mode == "filled" else "",
+                outline="blue" if mode == "filled" else "red",
+                width=4,
+                tags=("polygon",),
+            )
+
+    # def on_mouse_scroll(self, event):
+    #     # Normalize delta (some systems use different scales)
+    #     delta = int(-1 * (event.delta / 120))  # Scroll direction adjustment
+
+    #     # Scroll canvas vertically
+    #     self.canvas.yview_scroll(delta, "units")
+
+    #     # Get current scroll position
+    #     top_visible = self.canvas.yview()[0] <= 0.01
+    #     bottom_visible = self.canvas.yview()[1] >= 0.99
+
+    #     if bottom_visible and delta > 0:  # Scroll down at bottom
+    #         if self.current_page < len(self.pdf_document) - 1:
+    #             self.current_page += 1
+    #             self.render_page(self.current_page)
+    #             self.update_thumbnail_selection(self.current_page)
+    #             self.update_page_display()
+    #             self.canvas.yview_moveto(0.0)
+
+    #     elif top_visible and delta < 0:  # Scroll up at top
+    #         if self.current_page > 0:
+    #             self.current_page -= 1
+    #             self.render_page(self.current_page)
+    #             self.update_thumbnail_selection(self.current_page)
+    #             self.update_page_display()
+    #             # Move to bottom of the previous page
+    #             self.canvas.yview_moveto(1.0)
+
+    # # mouse scroll event for horizontal scrolling
+    # def on_shift_mouse_scroll(self, event):
+    #     """Handles horizontal scrolling when Shift is held."""
+    #     if self.page_width > self.canvas.winfo_width():  # Scroll only if page is wider
+    #         self.canvas.xview_scroll(-1 * (event.delta // 120), "units")
+
+    # def on_mouse_scroll(self, event):
+    #     # Get canvas dimensions and page dimensions
+    #     canvas_width = self.canvas.winfo_width()
+    #     canvas_height = self.canvas.winfo_height()
+    #     actual_page_width = self.page_width * self.zoom_factor
+    #     actual_page_height = self.page_height * self.zoom_factor
+    #     num_pages = len(self.pdf_document) if self.pdf_document else 0
+    #     delta = int(-1 * (event.delta / 120))  # Scroll direction adjustment
+        
+    #     # Check if this is the first page and we're trying to scroll up
+    #     at_first_page = self.current_page == 0
+    #     scrolling_up = delta < 0
+        
+    #     # Special case: First page, scrolling up, and page smaller than canvas
+    #     if at_first_page and scrolling_up and actual_page_height <= canvas_height:
+    #         # Don't do anything - prevent the scroll
+    #         return
+        
+    #     # Get scroll position
+    #     top_visible = self.canvas.yview()[0] <= 0.01
+    #     bottom_visible = self.canvas.yview()[1] >= 0.99
+        
+    #     # Normal scrolling logic for when page is larger than canvas
+    #     if actual_page_height > canvas_height or (not at_first_page):
+    #         self.canvas.yview_scroll(delta, "units")
+        
+    #     # Page navigation when reaching bottom/top of current page
+    #     if bottom_visible and delta > 0:  # Scroll down at bottom
+    #         if self.current_page < num_pages - 1:
+    #             self.current_page += 1
+    #             self.render_page(self.current_page)
+    #             self.update_thumbnail_selection(self.current_page)
+    #             self.update_page_display()
+    #             self.canvas.yview_moveto(0.0)
+    #     elif top_visible and delta < 0:  # Scroll up at top
+    #         if self.current_page > 0:
+    #             self.current_page -= 1
+    #             self.render_page(self.current_page)
+    #             self.update_thumbnail_selection(self.current_page)
+    #             self.update_page_display()
+    #             self.canvas.yview_moveto(1.0)
+
+    def on_mouse_scroll(self, event):
+        """Handle mouse wheel scrolling for both page navigation and in-page scrolling."""
+        # Get canvas dimensions and page dimensions
+        canvas_width = self.canvas.winfo_width()
+        canvas_height = self.canvas.winfo_height()
+        actual_page_width = self.page_width * self.zoom_factor
+        actual_page_height = self.page_height * self.zoom_factor
+        num_pages = len(self.pdf_document) if self.pdf_document else 0
+        delta = int(-1 * (event.delta / 120))  # Scroll direction adjustment
+        
+        # Get current scroll position
+        y_top, y_bottom = self.canvas.yview()
+        top_visible = y_top <= 0.01
+        bottom_visible = y_bottom >= 0.99
+        
+        # Check conditions
+        at_first_page = self.current_page == 0
+        at_last_page = self.current_page == num_pages - 1
+        scrolling_up = delta < 0
+        scrolling_down = delta > 0
+        page_fits_in_canvas = actual_page_height <= canvas_height
+        
+        # Case 1: Page fits entirely in canvas - only handle page navigation
+        if page_fits_in_canvas:
+            # When page fits in canvas, only allow page navigation, not scrolling within page
+            if scrolling_down and not at_last_page:
+                # Go to next page
+                self.current_page += 1
+                self.render_page(self.current_page)
+                self.update_thumbnail_selection(self.current_page)
+                self.update_page_display()
+                return
+            elif scrolling_up and not at_first_page:
+                # Go to previous page
+                self.current_page -= 1
+                self.render_page(self.current_page)
+                self.update_thumbnail_selection(self.current_page)
+                self.update_page_display()
+                return
+            # If we're at first page scrolling up or last page scrolling down,
+            # don't do anything (prevents unwanted movement)
+            return
+        
+        # Case 2: Page is larger than canvas - allow both scrolling and page navigation
+        else:
+            # Store the current scroll position before scrolling
+            prev_y_top = y_top
+            
+            # Normal scrolling within the page
+            self.canvas.yview_scroll(delta, "units")
+            
+            # Check if we need to navigate pages after scrolling
+            new_y_top, new_y_bottom = self.canvas.yview()
+            
+            # If scroll position didn't change, it means we hit a boundary
+            reached_boundary = (prev_y_top == new_y_top and scrolling_up) or \
+                            (new_y_bottom == y_bottom and scrolling_down)
+            
+            # Handle page navigation at boundaries
+            if new_y_bottom >= 0.99 and scrolling_down and not at_last_page:
+                # At bottom of page, go to next page
+                self.current_page += 1
+                self.render_page(self.current_page)
+                self.update_thumbnail_selection(self.current_page)
+                self.update_page_display()
+                self.canvas.yview_moveto(0.0)  # Position at top of new page
+            elif new_y_top <= 0.01 and scrolling_up and not at_first_page:
+                # At top of page, go to previous page
+                self.current_page -= 1
+                self.render_page(self.current_page)
+                self.update_thumbnail_selection(self.current_page)
+                self.update_page_display()
+                self.canvas.yview_moveto(1.0)  # Position at bottom of new page
+    
+    def on_shift_mouse_scroll(self, event):
+        """Handles horizontal scrolling when Shift is held."""
+        # Calculate actual page width with zoom factor
+        actual_page_width = self.page_width * self.zoom_factor
+        canvas_width = self.canvas.winfo_width()
+        
+        # Only allow horizontal scrolling if the page width exceeds the canvas width
+        if actual_page_width > canvas_width:
+            self.canvas.xview_scroll(-1 * (event.delta // 120), "units")
+
+    # def on_shift_mouse_scroll(self, event):
+    #     """Handles horizontal scrolling when Shift is held."""
+    #     # Calculate actual page width with zoom factor
+    #     actual_page_width = self.page_width * self.zoom_factor
+    #     canvas_width = self.canvas.winfo_width()
+        
+    #     # Only allow horizontal scrolling if the page width exceeds the canvas width
+    #     # or we're in a multi-page document
+    #     num_pages = len(self.pdf_document) if self.pdf_document else 0
+        
+    #     if actual_page_width > canvas_width or num_pages > 1:
+    #         self.canvas.xview_scroll(-1 * (event.delta // 120), "units")
+
+    def enable_sticky_note_mode(self):
+        """Activate sticky note mode."""
+        self.sticky_note_mode = True
+        self.highlight_mode = False
+
+        # Unbind previous actions and bind the sticky note click action
+        self.canvas.unbind("<B1-Motion>")
+        self.canvas.unbind("<ButtonRelease-1>")
+        self.canvas.bind("<Button-1>", self.on_canvas_click)
+    
+
+    def redraw_sticky_notes(self):
+        """Redraw sticky notes after rendering the page and adjust for rotation."""
+        self.canvas.delete("sticky_note")
+        if not self.pdf_document:
+            return
+            
+        page = self.pdf_document[self.current_page]
+        rotation_angle = page.rotation  # Get current page rotation
+
+        for (page_num, x_scaled, y_scaled), _ in self.sticky_notes.items():
+            if page_num == self.current_page:
+                x_position = x_scaled * self.zoom_factor
+                y_position = y_scaled * self.zoom_factor
+
+                # Get page dimensions at the current zoom level
+                page_width = page.rect.width * self.zoom_factor
+                page_height = page.rect.height * self.zoom_factor
+
+                # Adjust coordinates based on rotation
+                if rotation_angle == 90:
+                    if is_small_page == "yes":
+                        rotated_x, rotated_y = self.page_height+(180*self.zoom_factor) - y_position, x_position
+                    elif is_small_page == "slightly":
+                        rotated_x, rotated_y = self.page_height+(1050*self.zoom_factor) - y_position, x_position
+                    elif is_small_page == "longer":
+                        rotated_x, rotated_y = self.page_height+(720*self.zoom_factor) - y_position, x_position
+                    elif is_small_page == "maybe":
+                        rotated_x, rotated_y = self.page_height+(750*self.zoom_factor) - y_position, x_position
+                    elif is_small_page == "nope large":
+                        rotated_x, rotated_y = self.page_height+(1000*self.zoom_factor) - y_position, x_position
+                    elif is_small_page == "nope very large":
+                        rotated_x, rotated_y = self.page_height+(4300*self.zoom_factor) - y_position, x_position
+                    else:
+                        rotated_x, rotated_y = self.page_height+(2000*self.zoom_factor) - y_position, x_position
+                elif rotation_angle == 180:
+                    rotated_x = page_width - x_position
+                    rotated_y = page_height - y_position
+                elif rotation_angle == 270:
+                    if is_small_page == "yes":
+                        rotated_x, rotated_y = y_position, self.page_width-(180*self.zoom_factor) - x_position
+                    elif is_small_page == "slightly":
+                        rotated_x, rotated_y =y_position, self.page_width-(1050*self.zoom_factor) - x_position
+                    elif is_small_page == "longer":
+                        rotated_x, rotated_y = y_position, self.page_width-(720*self.zoom_factor) - x_position
+                    elif is_small_page == "maybe":
+                        rotated_x, rotated_y = y_position, self.page_width-(750*self.zoom_factor) - x_position
+                    elif is_small_page == "nope large":
+                        rotated_x, rotated_y = y_position, self.page_height-(1000*self.zoom_factor)- x_position
+                    elif is_small_page == "nope very large":
+                        rotated_x, rotated_y = y_position, self.page_height-(4300*self.zoom_factor)- x_position
+                    else:
+                        rotated_x, rotated_y = y_position, self.page_height-(2000*self.zoom_factor) - x_position
+           
+                else:  # 0 degrees
+                    rotated_x = x_position
+                    rotated_y = y_position
+                    
+                self.canvas.create_image(
+                    rotated_x, rotated_y,
+                    image=self.icons['thumb_pin'],
+                    anchor="center",
+                    tags="sticky_note"
+                )
+        self.annotation_is_available = True
+        self.root.update_idletasks()
+  
+    def on_canvas_click(self, event):
+        """Add a sticky note at the clicked position on the canvas."""
+        if not self.pdf_document or not self.sticky_note_mode:
+            return
+
+        x = self.canvas.canvasx(event.x)
+        y = self.canvas.canvasy(event.y)
+
+        if x < 0 or x > self.page_width or y < 0 or y > self.page_height:
+            return
+
+        note_text = self.ask_for_note_text(x, y,"Add Sticky Note")
+        if not note_text:
+            return
+
+        x_scaled = x / self.zoom_factor
+        y_scaled = y / self.zoom_factor
+
+        self.sticky_notes[(self.current_page, x_scaled, y_scaled)] = note_text
+        # changes_data = ("sticky_note", self.current_page, x_scaled, y_scaled, note_text)
+        # changes_data = str(changes_data)
+        # sql_check = """
+        #     SELECT COUNT(*) FROM pdf_editor_details 
+        #     WHERE folder_path = %s AND filename = %s AND changes_data = %s
+        # """
+        # mycursor.execute(sql_check, (folderpath, beforeexe, changes_data))
+        # result = mycursor.fetchone()
+        # if result[0] == 0:
+        #     sql = "CALL sp_InsertPDFEditorDetails(%s, %s, %s, %s)"
+        #     val = (beforeexe,folderpath,changes_data,0)
+        #     mycursor.execute(sql, val)
+        #     mydb.commit()
+        self.change_history.append(("sticky_note", self.current_page, x_scaled, y_scaled, note_text))
+        print("Sticky note added at:", x_scaled, y_scaled)
+        print("Sticky notes:----",self.change_history)
+        # Safely retrieve the icon for sticky notes
+        self.annotation_is_available = True
+        sticky_icon = self.icons.get("thumb_pin")
+        if sticky_icon:
+            self.canvas.create_image(x, y, image=sticky_icon, anchor="center", tags="sticky_note")
+        else:
+            print("Warning: 'sticky_note' icon not found.")  # Refresh to apply the changes
+        self.annotation_listed.append("sticky_note")
+
+    def ask_for_note_text(self, x, y,title):
+        """Prompt the user to enter sticky note text with a modern UI and return the entered text."""
+        dialog = ctk.CTkToplevel(self.root)
+        dialog.title(title)
+        dialog.geometry("400x250")
+        dialog.resizable(False, False)
+
+        label = ctk.CTkLabel(
+            dialog, text="Enter your note:", font=ctk.CTkFont(size=14, weight="bold")
+        )
+        label.pack(pady=(15, 10))
+
+        text_box = ctk.CTkTextbox(dialog, wrap="word", height=100, width=360)
+        text_box.pack(padx=15, pady=5, fill="x")
+        text_box.focus_set()
+
+        note_text_var = ctk.StringVar()
+
+        # Button functionality
+        def on_ok_click():
+            note_text = text_box.get("1.0", "end").strip()
+            if note_text:
+                note_text_var.set(note_text)
+                dialog.destroy()
+            else:
+                messagebox.showerror("Empty Note", "You must enter some text to save the sticky note.")
+
+        # Create buttons
+        buttons_frame = ctk.CTkFrame(dialog)
+        buttons_frame.pack(side="bottom", pady=15)
+
+        ok_button = ctk.CTkButton(
+            buttons_frame, text="Apply", command=on_ok_click, fg_color="#00498f", text_color="white"
+        )
+        ok_button.pack(side="left", padx=10)
+
+        cancel_button = ctk.CTkButton(
+            buttons_frame, text="Cancel", command=dialog.destroy, fg_color="#6c757d", text_color="white"
+        )
+        cancel_button.pack(side="left", padx=10)
+
+        dialog.grab_set()
+        dialog.wait_window()
+
+        self.sticky_note_mode = False
+        self.add_text_mode = False
+        self.add_text_bg_mode = False
+        return note_text_var.get() or None
+    
+    def enable_delete_annotation_mode(self):
+        """Enable deletion mode for any annotation type."""
+        self.deactivate_tools()
+        self.canvas.bind("<Button-1>", self.delete_annotation_at_point)
+
+    def delete_annotation_at_point(self, event):
+        click_x = self.canvas.canvasx(event.x) / self.zoom_factor
+        click_y = self.canvas.canvasy(event.y) / self.zoom_factor
+        click_point = fitz.Point(click_x, click_y)
+        page = self.pdf_document[self.current_page]
+        
+
+        # --- Step 1: Delete PDF annotations (highlight, text, sticky note, etc.) ---
+        annot = page.first_annot
+        while annot:
+            rect = annot.rect
+            if rect.contains(click_point):
+                annot_type = annot.type[0]
+
+                # Delete PDF-based annotation
+                page.delete_annot(annot)
+
+                # Remove from history for highlight, text, text_bg, sticky_note
+                self.change_history = [
+                    entry for entry in self.change_history
+                    if not (
+                        entry[0] in ("highlight", "add_text", "add_text_bg", "sticky_note")
+                        and entry[1] == self.current_page
+                    )
+                ]
+                self.render_page(self.current_page)
+                return
+            annot = annot.next
+
+        # --- Step 2: Canvas-based items ---
+        for entry in reversed(self.change_history):
+            action_type = entry[0]
+
+            # Freehand
+            if action_type == "freehand":
+                _, _, line_id, _ = entry
+                bbox = self.canvas.bbox(line_id)
+                if bbox and bbox[0] <= click_x * self.zoom_factor <= bbox[2] and bbox[1] <= click_y * self.zoom_factor <= bbox[3]:
+                    self.canvas.delete(line_id)
+                    self.change_history.remove(entry)
+                    self.render_page(self.current_page)
+                    return
+                
+            # Rectangle
+            elif action_type == "add_annotation":
+                annotation_data = entry[1]
+                if annotation_data.get("type") == "rectangle":
+                    x1 = annotation_data.get("x1")
+                    y1 = annotation_data.get("y1")
+                    x2 = annotation_data.get("x2")
+                    y2 = annotation_data.get("y2")
+                    if x1 is not None and y1 is not None and x2 is not None and y2 is not None:
+                        if x1 <= click_x <= x2 and y1 <= click_y <= y2:
+                            if "id" in annotation_data:
+                                self.canvas.delete(annotation_data["id"])
+                            self.rectangles = [rect for rect in self.rectangles if rect != annotation_data]
+                            self.annotations = [ann for ann in self.annotations 
+                                                if not (isinstance(ann, dict) and ann.get('id') == annotation_data.get('id'))]
+                            self.change_history.remove(entry)
+                            self.render_page(self.current_page)
+                            return
+                annotation_type = annotation_data.get("type")
+                canvas_id = annotation_data.get("id")
+
+            # Ellipse
+            elif action_type == "ellipse":
+                _, x1, y1, x2, y2, ellipse_id, _ = entry
+                if x1 <= click_x <= x2 and y1 <= click_y <= y2:
+                    self.canvas.delete(ellipse_id)
+                    self.annotations = [a for a in self.annotations if not (isinstance(a, tuple) and a[0] == "ellipse" and a[5] == ellipse_id)]
+                    self.change_history.remove(entry)
+                    self.render_page(self.current_page)
+                    return
+            # Image overlay
+            elif action_type == "image_overlay":
+                _, page_no, overlay_info = entry
+                if page_no == self.current_page and "canvas_id" in overlay_info:
+                    coords = self.canvas.bbox(overlay_info["canvas_id"])
+                    if coords and coords[0] <= click_x * self.zoom_factor <= coords[2] and coords[1] <= click_y * self.zoom_factor <= coords[3]:
+                        self.canvas.delete(overlay_info["canvas_id"])
+                        if hasattr(self, "tk_images") and overlay_info["id"] in self.tk_images:
+                            del self.tk_images[overlay_info["id"]]
+                        self.image_overlays = [i for i in self.image_overlays if i["id"] != overlay_info["id"]]
+                        self.change_history.remove(entry)
+                        self.render_page(self.current_page)
+                        return
+                    
+            elif action_type in ("add_text", "add_text_bg"):
+                _, page, x_scaled, y_scaled, text = entry
+                if page == self.current_page:
+                    # Convert stored scaled coordinates back to pixel units
+                    x_pixel = x_scaled * self.zoom_factor
+                    y_pixel = y_scaled * self.zoom_factor
+                    radius = 5  # Tolerance for click proximity
+                    if abs(click_x * self.zoom_factor - x_pixel) <= radius and abs(click_y * self.zoom_factor - y_pixel) <= radius:
+                        annotation_dict = self.text_annotations if action_type == "add_text" else self.text_annotations_bg
+                        if (page, x_scaled, y_scaled) in annotation_dict:
+                            del annotation_dict[(page, x_scaled, y_scaled)]
+                        page_obj = self.pdf_document[page]
+                        annot = page_obj.first_annot
+                        while annot:
+                            if annot.info and annot.info.get("contents") == text:
+                                page_obj.delete_annot(annot)
+                                break
+                            annot = annot.next
+                        self.change_history.remove(entry)
+                        self.render_page(self.current_page)
+                        return
+
+    # Helper method to determine if a point is near a line
+    def point_near_line(self, px, py, line_coords):
+        """Check if point (px, py) is near a line defined by line_coords."""
+        # Threshold distance (adjust as needed)
+        threshold = 5.0 / self.zoom_factor
+        
+        if len(line_coords) >= 4:  # At least 2 points (start and end)
+            x1, y1, x2, y2 = line_coords[0], line_coords[1], line_coords[2], line_coords[3]
+            
+            # Calculate distance from point to line segment
+            # Formula: distance = |((x2-x1)*(y1-py) - (x1-px)*(y2-y1))| / sqrt((x2-x1)^2 + (y2-y1)^2)
+            num = abs((x2-x1)*(y1-py) - (x1-px)*(y2-y1))
+            denom = ((x2-x1)**2 + (y2-y1)**2)**0.5
+            
+            if denom == 0:  # Avoid division by zero
+                distance = ((px-x1)**2 + (py-y1)**2)**0.5  # Point-to-point distance
+            else:
+                distance = num / denom
+            
+            # Check if point is close enough to the line
+            if distance <= threshold:
+                # Also check if the point is roughly within the bounding box of the line
+                min_x, max_x = min(x1, x2) - threshold, max(x1, x2) + threshold
+                min_y, max_y = min(y1, y2) - threshold, max(y1, y2) + threshold
+                
+                if min_x <= px <= max_x and min_y <= py <= max_y:
+                    return True
+        
+        return False
+
+    def enable_delete_highlight_mode(self):
+        self.deactivate_tools()
+        self.canvas.bind("<Button-1>", self.delete_highlight_at_point)
+
+    def delete_highlight_at_point(self, event):
+        click_x = self.canvas.canvasx(event.x) / self.zoom_factor
+        click_y = self.canvas.canvasy(event.y) / self.zoom_factor
+        click_point = fitz.Point(click_x, click_y)
+
+        page = self.pdf_document[self.current_page]
+        annot = page.first_annot
+        while annot:
+            if annot.type[0] == 8:  # Highlight annotation
+                if annot.rect.contains(click_point):
+                    # Optional: also match by 'id' and remove from change_history
+                    page.delete_annot(annot)
+                    self.render_page(self.current_page)
+                    return
+            annot = annot.next
+
+
+    def undo_change(self):
+        print("Undoing the last change...",self.change_history)
+        if not self.change_history:
+            return
+
+        last_action = self.change_history.pop()
+        action_type = last_action[0]
+        
+        if action_type == "highlight":
+            _, page, annot_id = last_action
+            page_obj = self.pdf_document[page]
+            annot = page_obj.first_annot
+            while annot:
+                if annot.info.get('id') == annot_id:
+                    page_obj.delete_annot(annot)
+                    self.render_page(self.current_page)
+                    break
+                annot = annot.next
+            if self.annotation_listed[-1]=="highlight":
+                self.annotation_listed.pop()
+        
+        elif action_type == "freehand":
+            _, page, line_id, _ = last_action
+            # Remove from the canvas
+            self.canvas.delete(line_id)
+            # Remove from history
+            self.change_history = [entry for entry in self.change_history if entry[2] != line_id]
+            # Redraw remaining freehand drawings to refresh the canvas
+            self.redraw_freehand_drawings()
+            self.render_page(self.current_page)
+            if self.annotation_listed[-1]=="freehand":
+                self.annotation_listed.pop()
+        
+        elif action_type == "add_annotation":
+            # New code for undoing line, arrow, rectangle, and ellipse annotations
+            annotation_data = last_action[1]
+            annotation_type = annotation_data.get('type')
+            
+            # Remove from canvas
+            if 'id' in annotation_data:
+                self.canvas.delete(annotation_data['id'])
+            
+            # Remove from appropriate list
+            if annotation_type == 'line':
+                self.lines = [line for line in self.lines if line != annotation_data]
+                if self.annotation_listed[-1]=="line":
+                    self.annotation_listed.pop()
+            elif annotation_type == 'arrow':
+                self.arrows = [arrow for arrow in self.arrows if arrow != annotation_data]
+                if self.annotation_listed[-1]=="arrow":
+                    self.annotation_listed.pop()
+            elif annotation_type == 'rectangle':
+                self.rectangles = [rect for rect in self.rectangles if rect != annotation_data]
+                if self.annotation_listed[-1]=="rectangle":
+                    self.annotation_listed.pop()
+            # Remove from annotations list
+            self.annotations = [ann for ann in self.annotations 
+                            if not (isinstance(ann, dict) and ann.get('id') == annotation_data.get('id'))]
+            self.render_page(self.current_page)
+
+        elif action_type == "ellipse":
+            # Handle ellipse annotations
+            _, x1, y1, x2, y2, ellipse_id, mode = last_action
+            if ellipse_id:
+                self.canvas.delete(ellipse_id)
+            # Remove from annotations list
+            ellipse_to_remove = None
+            for ann in self.annotations:
+                if isinstance(ann, tuple) and ann[0] == 'ellipse' and ann[1] == x1 and ann[2] == y1 and ann[3] == x2 and ann[4] == y2:
+                    ellipse_to_remove = ann
+                    break
+            if ellipse_to_remove:
+                self.annotations.remove(ellipse_to_remove)
+            if self.annotation_listed[-1]=="ellipse":
+                self.annotation_listed.pop()
+            self.render_page(self.current_page)
+
+        elif action_type in ("add_text", "add_text_bg"):
+            _, page, x_scaled, y_scaled, text = last_action
+            annotation_dict = self.text_annotations if action_type == "add_text" else self.text_annotations_bg
+            if (page, x_scaled, y_scaled) in annotation_dict:
+                del annotation_dict[(page, x_scaled, y_scaled)]
+                page_obj = self.pdf_document[page]
+                annot = page_obj.first_annot
+                while annot:
+                    if annot.info and annot.info.get("contents") == text:
+                        page_obj.delete_annot(annot)
+                        break
+                    annot = annot.next
+                self.render_page(self.current_page)
+            if self.annotation_listed[-1]=="text_bg":
+                self.annotation_listed.pop()
+            elif self.annotation_listed[-1]=="text":
+                self.annotation_listed.pop()
+
+        elif action_type == "polygon":
+            _, page, prev_state, polygon_id = last_action
+            if page in self.page_drawings:
+                for i, (mode, points, pid) in enumerate(self.page_drawings[page]):
+                    if pid == polygon_id:
+                        if prev_state is None:
+                            # Undo polygon creation (remove it)
+                            self.canvas.delete(polygon_id)
+                            del self.page_drawings[page][i]
+                        else:
+                            # Restore previous state (undo move/reshape)
+                            self.page_drawings[page][i] = (mode, prev_state, polygon_id)
+                            self.canvas.coords(polygon_id, prev_state)
+                        break
+                self.render_page(self.current_page)
+            if self.annotation_listed[-1]=="polygon":
+                self.annotation_listed.pop()
+
+        elif action_type == "sticky_note":
+            _, page, x_scaled, y_scaled, _ = last_action
+            if (page, x_scaled, y_scaled) in self.sticky_notes:
+                del self.sticky_notes[(page, x_scaled, y_scaled)]
+                if self.annotation_listed[-1]=="sticky_note":
+                    self.annotation_listed.pop()
+                self.render_page(self.current_page)
+
+        elif action_type == "image_overlay":
+            _, page, overlay_info = last_action
+            # Remove from image_overlays list
+            if hasattr(self, "image_overlays"):
+                self.image_overlays = [overlay for overlay in self.image_overlays 
+                                    if overlay["id"] != overlay_info["id"]]
+            
+            # Delete the image from canvas if it exists
+            if "canvas_id" in overlay_info:
+                self.canvas.delete(overlay_info["canvas_id"])
+            
+            # Remove from tk_images dictionary to free memory
+            if hasattr(self, "tk_images") and overlay_info["id"] in self.tk_images:
+                del self.tk_images[overlay_info["id"]]
+            
+            if self.annotation_listed[-1]=="image_overlay":
+                self.annotation_listed.pop()
+            
+            # Only re-render if we're on the same page
+            if page == self.current_page:
+                self.render_page(self.current_page)
+
+        else:
+            print(f"Unknown action type: {action_type}")
+
+
+    def enable_highlight_mode(self):
+        """ Activate highlight mode """
+        self.deactivate_tools()
+        self.highlight_mode = True   
+        # self.highlight_button.configure(fg_color="#d17a24")
+        self.is_drawing_hollow_rect = False
+        self.is_drawing_filled_rect = False
+        self.canvas.bind("<Button-1>", self.start_highlight_rectangle)
+        self.canvas.bind("<B1-Motion>", self.draw_highlight_rectangle)
+        self.canvas.bind("<ButtonRelease-1>", self.finalize_highlight)
+
+    def start_highlight_rectangle(self, event):
+        """Start a rectangle selection for highlighting"""
+        self.start_x = self.canvas.canvasx(event.x)
+        self.start_y = self.canvas.canvasy(event.y)
+        
+        # Delete any existing highlight preview
+        if self.rectangle_id:
+            self.canvas.delete(self.rectangle_id)
+        
+        # Draw the initial rectangle immediately
+        self.rectangle_id = self.canvas.create_rectangle(
+            self.start_x, self.start_y, self.start_x + 1, self.start_y + 1,
+            outline="yellow", width=2)
+
+    def draw_highlight_rectangle(self, event):
+        """Draw the rectangle dynamically as the mouse is dragged."""
+        if self.rectangle_id is None:
+            return  # Prevents calling coords on None
+        
+        current_x = self.canvas.canvasx(event.x)
+        current_y = self.canvas.canvasy(event.y)
+        # Update rectangle coordinates safely
+        self.canvas.coords(self.rectangle_id, self.start_x, self.start_y, current_x, current_y)
+
+
+    def finalize_highlight(self, event):
+        """Finalize the highlight and save it to the PDF."""
+        if self.start_x is None or self.start_y is None:
+            return
+        end_x = self.canvas.canvasx(event.x) / self.zoom_factor
+        end_y = self.canvas.canvasy(event.y) / self.zoom_factor
+        start_x = self.start_x / self.zoom_factor
+        start_y = self.start_y / self.zoom_factor
+        rect = fitz.Rect(min(start_x, end_x), min(start_y, end_y), max(start_x, end_x), max(start_y, end_y))
+        page = self.pdf_document[self.current_page]
+        rotation = page.rotation
+        page_width, page_height = self.page_width / self.zoom_factor, self.page_height / self.zoom_factor
+        if rotation == 90:
+            rect = fitz.Rect(
+                rect.y0,
+                page_width - rect.x1,
+                rect.y1,
+                page_width - rect.x0)
+        elif rotation == 180:
+            rect = fitz.Rect(
+                page_width - rect.x1,
+                page_height - rect.y1,
+                page_width - rect.x0,
+                page_height - rect.y0)
+        elif rotation == 270:
+            rect = fitz.Rect(
+                page_height - rect.y1,
+                rect.x0,
+                page_height - rect.y0,
+                rect.x1)
+        try:
+            highlight = page.add_highlight_annot(rect)
+            highlight.update()
+            highlight.set_border(width=0, dashes=(0, 0))
+            annot_id = highlight.info.get('id')
+            # changes_data = ("highlight", self.current_page, annot_id)
+            # changes_data = str(changes_data)
+            # if annot_id:
+            #     sql_check = """
+            #         SELECT COUNT(*) FROM pdf_editor_details 
+            #         WHERE folder_path = %s AND filename = %s AND changes_data = %s
+            #     """
+            #     mycursor.execute(sql_check, (self.doc_id, beforeexe, changes_data))
+            #     result = mycursor.fetchone()
+            #     if result[0] == 0:
+            #         print(f"Added highlight with ID: {annot_id}")
+            #         print("beforeexe----",beforeexe)
+            #         sql = "CALL sp_InsertPDFEditorDetails(%s, %s, %s, %s)"
+            #         val = (beforeexe,self.doc_id,changes_data,0)
+            #         mycursor.execute(sql, val)
+            #         mydb.commit()
+            if annot_id:
+                self.change_history.append(("highlight", self.current_page, annot_id))
+                print("highlight added",self.change_history)
+                self.annotation_is_available = True
+                self.annotation_listed.append("highlight")
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to add highlight: please drag the area you want to highlight")
+            return    
+        self.render_page(self.current_page)
+        # self.highlight_button.configure(fg_color="#00498f")
+        self.canvas.unbind("<B1-Motion>")
+        self.canvas.unbind("<ButtonRelease-1>")
+        self.deactivate_tools()
+
+    def on_mouse_hover(self, event):
+        """Change cursor when hovering over a polygon or sticky note."""
+        if not self.pdf_document or self.current_page is None:
+            return
+        x, y = self.canvas.canvasx(event.x), self.canvas.canvasy(event.y)
+        tooltip_shown = False
+        page = self.pdf_document[self.current_page]
+        rotation_angle = page.rotation
+
+        # Adjust the coordinates for zoom
+        adjusted_x, adjusted_y = x / self.zoom_factor, y / self.zoom_factor
+
+        for drawing in self.page_drawings.get(self.current_page, []):
+            if isinstance(drawing, tuple) and len(drawing) == 3:  # Polygon (id, points, color)
+                _, points, _ = drawing
+
+                # Adjust the polygon coordinates for zoom
+                zoomed_points = [(px * self.zoom_factor, py * self.zoom_factor) for px, py in zip(points[::2], points[1::2])]
+
+                if self.is_point_inside_polygon(x, y, sum(zoomed_points, ())):  # Flatten the list
+                    self.canvas.config(cursor="hand2")
+                    return  # Exit function early if hovering over a polygon
+
+        # Sticky note cursor handling
+        for (page_num, x_scaled, y_scaled), text in self.sticky_notes.items():
+            if page_num == self.current_page:
+                x_position = x_scaled * self.zoom_factor
+                y_position = y_scaled * self.zoom_factor
+                page_width = page.rect.width * self.zoom_factor
+                page_height = page.rect.height * self.zoom_factor
+
+                # Handle rotation
+                if rotation_angle == 90:
+                    rotated_x, rotated_y = self.page_height + (180 * self.zoom_factor) - y_position, x_position
+                elif rotation_angle == 180:
+                    rotated_x = page_width - x_position
+                    rotated_y = page_height - y_position
+                elif rotation_angle == 270:
+                    rotated_x, rotated_y = y_position, self.page_width - (180 * self.zoom_factor) - x_position
+                else:  # 0 degrees
+                    rotated_x = x_position
+                    rotated_y = y_position
+
+                if abs(x - rotated_x) < 20 and abs(y - rotated_y) < 20:  # Adjust hover sensitivity
+                    if not tooltip_shown:
+                        self.show_tooltip(event.x_root, event.y_root, text)
+                        tooltip_shown = True
+                    break
+
+        if not tooltip_shown:
+            if self.active_tooltip:
+                self.active_tooltip.destroy()
+                self.active_tooltip = None
+            self.canvas.config(cursor="arrow")  # Ensure cursor resets correctly
+
+
+    def show_tooltip(self, x, y, text):
+        """Display the sticky note text as a tooltip."""
+        if getattr(self, "active_tooltip", None):
+            self.active_tooltip.destroy()
+        wraptext = textwrap.fill(text, width=50)  # Ensuring the line ends at 50 characters
+        today = date.today().strftime("%m-%d-%Y")
+        wrapped_text = f"{today}\n\n{wraptext}"
+        tooltip = ctk.CTkToplevel(self.root)
+        tooltip.overrideredirect(True)
+        tooltip.geometry(f"+{int(x) + 10}+{int(y) + 10}")  # Ensure integer coordinates
+        label = ctk.CTkLabel(
+            tooltip, text=wrapped_text, bg_color="light yellow", text_color="black", padx=10, pady=5
+        )
+        label.pack()
+        if getattr(self, "active_tooltip", None):
+            self.active_tooltip.destroy()
+        self.active_tooltip = tooltip
+
+    def toggle_sticky_note_mode(self):
+        """Toggle sticky note mode"""
+        if self.sticky_note_mode:
+            self.sticky_note_mode = False
+            self.canvas.unbind("<Button-1>")
+        else:
+            self.enable_sticky_note_mode()
+
+# -----------------------------------------------------------------------------------------------------------
+######################################################################################################################################
+    def save_pdf(self, file_path=None):
+        """Save the PDF with embedded sticky notes and upload directly to the server."""
+        if not self.pdf_document or self.current_page is None:
+            messagebox.showerror("Error", "No PDF document to save.")
+            return
+        if self.istempfile:
+            messagebox.showinfo("Info", "You cannot save a file within Temp folder.")
+            return
+        global edit_file_name
+        global beforeexe
+        print("self.annotation_listed",self.annotation_listed)
+        print("edit_file_name-----------------",edit_file_name)  
+        print("Serverurl--------------------------------------------------------------------------------------------------",self.server_url)
+        try:
+            temp_pdf = fitz.open()
+            for page_num in range(len(self.pdf_document)):
+                page = self.pdf_document[page_num]
+                temp_pdf.insert_pdf(self.pdf_document, from_page=page_num, to_page=page_num)
+
+            for page_num in self.page_drawings:
+                if page_num < len(temp_pdf):
+                    page = temp_pdf[page_num]
+                    # Manually embed polygons without changing current_page
+                    self._embed_polygons_to_page(page, page_num)
+            try:
+                for annotation in self.annotations:
+                    if isinstance(annotation, tuple) and annotation[0] == 'ellipse' and annotation[1] is not None:
+                        _, x1, y1, x2, y2, _, mode,numb = annotation
+                        page_num = numb
+                        page = temp_pdf[page_num]
+                        self.add_ellipse_annotation(page, x1, y1, x2, y2, mode)
+            except:
+                print("Error adding ellipse annotations")
+            
+            if hasattr(self, "image_overlays"):
+                for overlay in self.image_overlays:
+                    page_num = overlay["page"]
+                    if page_num < len(temp_pdf):
+                        page = temp_pdf[page_num]
+                        self.add_image_overlay_to_pdf(page, overlay)
+            print("terethetttehht reached here .........................")
+            try:
+                for rect in self.rectangles:
+                    if rect['type'] == 'rectangle' and rect['page'] < len(temp_pdf):
+                        page = temp_pdf[rect['page']]
+                        
+                        # Create a rectangle using the page's draw methods instead of annotations
+                        rect_coords = fitz.Rect(rect['x1'], rect['y1'], rect['x2'], rect['y2'])
+                        
+                        # Set color based on string color (convert to RGB tuple)
+                        if rect['color'] == "red":
+                            rgb_color = (1, 0, 0)  # Red in RGB (0-1 range)
+                        else:
+                            rgb_color = (0, 0, 0)  # Default to black
+                        
+                        # Draw rectangle on the page
+                        if rect['filled']:
+                            # For filled rectangle
+                            page.draw_rect(rect_coords, color=rgb_color, fill=rgb_color, width=4)
+                        else:
+                            # For hollow rectangle
+                            page.draw_rect(rect_coords, color=rgb_color, fill=None, width=6)
+
+
+                # Add line annotations
+                for line in self.lines:
+                    if line['type'] == 'line' and line['page'] < len(temp_pdf):
+                        page = temp_pdf[line['page']]
+                        # Create a line using PyMuPDF
+                        start_point = fitz.Point(line['x1'], line['y1'])
+                        end_point = fitz.Point(line['x2'], line['y2'])
+                        rgb_color = (1, 0, 0)  # Red in RGB (0-1 range)
+                        page.draw_line(start_point, end_point, color=rgb_color, width=6)
+                        
+                # Add arrow annotations
+                for arrow in self.arrows:
+                    if arrow['page'] < len(temp_pdf):
+                        page = temp_pdf[arrow['page']]
+                        start_point = fitz.Point(arrow['x1'], arrow['y1'])
+                        end_point = fitz.Point(arrow['x2'], arrow['y2'])
+                        
+                        # Create the arrow annotation
+                        annot = page.add_line_annot(start_point, end_point)
+                        annot.set_colors(stroke=(1, 0, 0))  # Red color
+                        ## Line end styles: 0=None, 1=Square, 2=Circle, 3=Diamond, 4=OpenArrow, 5=ClosedArrow, 6=Butt, 7=ROpenArrow, 8=RClosedArrow
+                        annot.set_line_ends(0, 5)  # First value is start style, second is end style (2 = arrow)
+                        annot.set_border(width=6)
+                        annot.update()
+
+            except Exception as e:
+                print(f"Error adding rectangle annotations: {str(e)}")
+            for (page_num, x_scaled, y_scaled), text in self.sticky_notes.items():
+                page = temp_pdf[page_num]
+                self.add_text_sticky_annotation(page, x_scaled, y_scaled, text)
+            for (page_num, x_scaled, y_scaled), annotation_data in self.text_annotations.items():
+                page = temp_pdf[page_num]           
+                if isinstance(annotation_data, dict):
+                    text = annotation_data["text"]
+                else:
+                    text = annotation_data
+                self.add_plain_text_annotation(page, x_scaled, y_scaled, text)
+            for (page_num, x_scaled, y_scaled), text in self.text_annotations_bg.items():
+                page = temp_pdf[page_num]
+                self.add_text_with_bg_annotation(page, x_scaled, y_scaled, text)
+            print("before freehand")
+            # Add freehand drawings to the PDF
+            for item in self.change_history:
+                if item[0] == "freehand":
+                    _, page_num, _, points = item
+                    page = temp_pdf[page_num]
+                    self.add_freehand_line_annotation(page, points)
+            pdf_buffer = io.BytesIO()
+            temp_pdf.save(pdf_buffer, garbage=4, deflate=True, deflate_images=True, clean=True)
+            pdf_buffer.seek(0)
+            print("before save function-----------------")
+            if len(self.change_redact_history) > 0 or len(self.redactions) > 0:
+                changes_data = self.change_redact_history
+                changes_data = str(changes_data)    
+                print("beforeexe----",beforeexe)
+                sql = "CALL sp_InsertPDFEditorDetails(%s, %s, %s, %s)"
+                val = (beforeexe,self.doc_id,changes_data,0)
+                mycursor.execute(sql, val)
+                mydb.commit()
+                if "_redact_with_annotations" in filename_pdf:
+                    edit_file_name = edit_file_name
+                    files = {'id': (None, self.doc_id),
+                            'file': (edit_file_name, pdf_buffer, 'application/pdf')}
+                    response = requests.post(self.server_url, files=files)
+                    if response.status_code in [200, 201]:
+                        messagebox.showinfo("Success", "File saved successfully")
+                        print("File saved successfully  _redact.pdf")
+                    else:
+                        messagebox.showerror("Error", "Failed to save the file.")
+                        return
+                elif "redact" in filename_pdf: 
+                    print("____________________redact.pdf")
+                    if len(self.annotation_listed)==0:   
+                        edit_file_name = edit_file_name
+                        print("redact_file_name--*****-",edit_file_name)
+                        files = {'id': (None, self.doc_id),
+                                'file': (edit_file_name, pdf_buffer, 'application/pdf')}
+                        response = requests.post(self.server_url, files=files)
+                        if response.status_code in [200, 201]:
+                            messagebox.showinfo("Success", "File saved successfully")
+                            print("File saved successfully  _redact.pdf")
+                        else:
+                            messagebox.showerror("Error", "Failed to save the file.")
+                            return  
+                    elif len(self.annotation_listed)>0:
+                        edit_file_name = edit_file_name.replace("redact", "redact_with_annotations")
+                        print("***************rdnsgrsrfb*******************************************************************rdrdht******************")
+                        print("redact_file_name--*****-",edit_file_name)
+                        files = {'id': (None, self.doc_id),
+                                'file': (edit_file_name, pdf_buffer, 'application/pdf')}
+                        response = requests.post(self.server_url, files=files)
+                        if response.status_code in [200, 201]:
+                            messagebox.showinfo("Success", "File saved successfully")
+                            print("File saved successfully  _redact.pdf")
+                        else:
+                            messagebox.showerror("Error", "Failed to save the file.")
+                            return
+                elif "with_annotations" in filename_pdf:
+                    edit_file_name = edit_file_name.replace("with_annotations", "redact_with_annotations")
+                    print("***************rdnsgrsrfb*******************************************************************rdrdht******************")
+                    print("redact_file_name--*****-",edit_file_name)
+                    files = {'id': (None, self.doc_id),
+                            'file': (edit_file_name, pdf_buffer, 'application/pdf')}
+                    response = requests.post(self.server_url, files=files)
+                    if response.status_code in [200, 201]:
+                        messagebox.showinfo("Success", "File saved successfully")
+                        print("File saved successfully  _redact.pdf")
+                    else:
+                        messagebox.showerror("Error", "Failed to save the file.")
+                        return
+
+                else:
+                    if len(self.annotation_listed)==0: 
+                        edit_file_name = edit_file_name.replace(".pdf", "_redact.pdf")
+                        print("***************rdnsgrsrfb*******************************************************************rdrdht******************")
+                        print("redact_file_name--*****-",edit_file_name)
+                        files = {'id': (None, self.doc_id),
+                                'file': (edit_file_name, pdf_buffer, 'application/pdf')}
+                        response = requests.post(self.server_url, files=files)
+                        if response.status_code in [200, 201]:
+                            messagebox.showinfo("Success", "File saved successfully")
+                            print("File saved successfully  _redact.pdf")
+                        else:
+                            messagebox.showerror("Error", "Failed to save the file.")
+                            return
+                    elif len(self.annotation_listed) > 0:
+                        edit_file_name = edit_file_name.replace(".pdf", "_redact_with_annotations.pdf")
+                        print("***************rdnsgrsrfb*******************************************************************rdrdht******************")
+                        print("redact_file_name--*****-",edit_file_name)
+                        files = {'id': (None, self.doc_id),
+                                'file': (edit_file_name, pdf_buffer, 'application/pdf')}
+                        response = requests.post(self.server_url, files=files)
+                        if response.status_code in [200, 201]:
+                            messagebox.showinfo("Success", "File saved successfully")
+                            print("File saved successfully  _redact.pdf")
+                        else:
+                            messagebox.showerror("Error", "Failed to save the file.")
+                            return
+            elif len(self.redactions) == 0:
+                print("no redactions svsvsfbbfxxfsdvxfsdfxfxf    elifff")      
+                if len(self.annotation_listed)>0:
+                    changes_data = self.change_history
+                    changes_data = str(changes_data)
+                    print("beforeexe----",beforeexe)
+                    sql = "CALL sp_InsertPDFEditorDetails(%s, %s, %s, %s)"
+                    val = (beforeexe,self.doc_id,changes_data,0)
+                    mycursor.execute(sql, val)
+                    mydb.commit()
+                    print("yes")                 
+                    if "redact_with_annotations" in edit_file_name:
+                        print("_____________________redact_with_annotations.pdf")
+                        edit_file_name = edit_file_name
+                        print("redact_file_name--*****-",edit_file_name)
+                        files = {'id': (None, self.doc_id),
+                                'file': (edit_file_name, pdf_buffer, 'application/pdf')}
+                        response = requests.post(self.server_url, files=files)
+                        if response.status_code in [200, 201]:
+                            messagebox.showinfo("Success", "File saved successfully")
+                        else:
+                            messagebox.showerror("Error", "Failed to save the file.")
+                            return
+                    elif "with_annotations" in edit_file_name:
+                        print("_____-----------------------________________with_annotations.pdf")
+                        edit_file_name = edit_file_name
+                        print("redact_file_name--*****-",edit_file_name)
+                        files = {'id': (None, self.doc_id),
+                                'file': (edit_file_name, pdf_buffer, 'application/pdf')}
+                        response = requests.post(self.server_url, files=files)
+                        if response.status_code in [200, 201]:
+                            messagebox.showinfo("Success", "File saved successfully")
+                        else:
+                            messagebox.showerror("Error", "Failed to save the file.")
+                            return
+                    elif "redact" in filename_pdf:
+                        print("___________------------------------_________redact.pdf")
+                        edit_file_name = edit_file_name.replace("redact", "redact_with_annotations")
+                        print("redact_file_name--*****-",edit_file_name)
+                        files = {'id': (None, self.doc_id),
+                                'file': (edit_file_name, pdf_buffer, 'application/pdf')}
+                        response = requests.post(self.server_url, files=files)
+                        if response.status_code in [200, 201]:
+                            messagebox.showinfo("Success", "File saved successfully")
+                        else:
+                            messagebox.showerror("Error", "Failed to save the file.")
+                            return
+                    else:
+                        print("elseee---------------------------------------------------------------")
+                        edit_file_name = edit_file_name.replace(".pdf", "_with_annotations.pdf")
+                        files = {'id': (None, self.doc_id),
+                                'file': (edit_file_name, pdf_buffer, 'application/pdf')}
+                        response = requests.post(self.server_url, files=files)
+                        if response.status_code in [200, 201]:
+                            messagebox.showinfo("Success", "File saved successfully")
+                        else:
+                            messagebox.showerror("Error", "Failed to save the file.")
+                            return
+                           
+                else:
+                    messagebox.showinfo("Info", "No Annotation made to save the file.")
+        except:
+            print(f"Failed to save PDF")
+
+    def add_ellipse_annotation(self, page, x1, y1, x2, y2, mode):
+        """Add ellipse annotation to the PDF page."""
+        try:
+            # Create a new shape on the page
+            shape = page.new_shape()
+            
+            # Calculate center and radii of the ellipse
+            cx = (x1 + x2) / 2
+            cy = (y1 + y2) / 2
+            rx = abs(x2 - x1) / 2
+            ry = abs(y2 - y1) / 2
+            
+            # Draw the ellipse
+            shape.draw_oval(fitz.Rect(x1, y1, x2, y2))
+            
+            # Set fill and stroke properties
+            fill_color = None
+            if mode == "filled":
+                fill_color = (1, 0.5, 0)  # Orange color
+            
+            # Finish the shape with or without fill
+            shape.finish(color=(1, 0.5, 0), fill=fill_color, width=6)
+            
+            # Commit the shape to the page
+            shape.commit(overlay=True)
+        except Exception as e:
+            print(f"Error adding ellipse annotation: {e}")
+
+    def add_image_overlay_to_pdf(self, page, overlay):
+        """Add image overlay to the PDF page."""
+        try:
+            # Extract overlay properties
+            base_x = overlay["base_x"]
+            base_y = overlay["base_y"]
+            base_width = overlay["base_width"]
+            base_height = overlay["base_height"]
+            image_path = overlay["image_path"]
+            
+            # Create a rectangle for the image placement
+            rect = fitz.Rect(base_x, base_y, base_x + base_width, base_y + base_height)
+            
+            # Check if the image file exists and is readable
+            if os.path.isfile(image_path):
+                try:
+                    # Insert the image onto the page
+                    page.insert_image(rect, filename=image_path)
+                except Exception as img_error:
+                    print(f"Error inserting image into PDF: {img_error}")
+            else:
+                print(f"Image file not found: {image_path}")
+        except Exception as e:
+            print(f"Error adding image overlay: {e}")
+
+    def _embed_polygons_to_page(self, page, page_num):
+        """Helper function to embed polygons to a specific page without changing self.current_page."""
+        try:
+            if page_num not in self.page_drawings:
+                return
+                
+            # Delete existing polygon annotations if any
+            for annot in page.annots():
+                if annot.info.get("title") == "polygon_annotation":
+                    annot.delete()
+                    
+            for drawing in self.page_drawings[page_num]:
+                if len(drawing) != 3:
+                    continue
+                    
+                mode, points, polygon_id = drawing
+                
+                # Skip if this polygon should be ignored
+                if hasattr(self, 'embedded_polygons') and page_num in self.embedded_polygons:
+                    if any(p[2] == polygon_id for p in self.embedded_polygons[page_num]):
+                        continue
+                        
+                # Convert points to pairs of coordinates
+                scaled_points = [(points[i], points[i + 1]) for i in range(0, len(points), 2)]
+                
+                path = page.new_shape()
+                # Draw lines between points to form the polygon
+                for i in range(len(scaled_points)):
+                    p1 = scaled_points[i]
+                    p2 = scaled_points[(i + 1) % len(scaled_points)]
+                    path.draw_line(p1, p2)
+                    
+                # Set fill or outline based on mode
+                if mode == "filled":
+                    path.finish(fill=(0, 0, 1), color=(0, 0, 0))
+                elif mode == "hollow":
+                    path.finish(color=(1, 0, 0), fill=None, width=6)
+                    
+                # Commit the shape to the page
+                path.commit(overlay=True)
+                
+                # Track that we've embedded this polygon
+                if not hasattr(self, 'embedded_polygons'):
+                    self.embedded_polygons = {}
+                if page_num not in self.embedded_polygons:
+                    self.embedded_polygons[page_num] = []
+                self.embedded_polygons[page_num].append(drawing)
+                
+        except Exception as e:
+            print(f"Error embedding polygons to page {page_num}: {e}")
+
+    def add_text_sticky_annotation(self, page, x_scaled, y_scaled, text):
+        """Helper function to add text annotations properly."""
+        today = date.today().strftime("%m-%d-%Y")
+        base_text_size = 20  
+        scaling_factor = max(page.rect.width, page.rect.height) / 1000  
+        text_size = int(base_text_size * scaling_factor)
+        marker_size = int(12 * scaling_factor)
+        text_offset = int(15 * scaling_factor)
+        padding = int(10 * scaling_factor)
+        vertical_padding = int(15 * scaling_factor)
+        
+        marker_color = (1, 0, 0)
+        page.draw_circle(center=(x_scaled, y_scaled), radius=marker_size / 2, color=marker_color, fill=marker_color)
+        
+        lines = self.wrap_text(f"{today}\n{text}", 50)
+        max_text_width = max(len(line) for line in lines) * text_size * 0.6
+        max_text_height = len(lines) * text_size * 1.5
+        background_width = max_text_width + padding * 2
+        background_height = max_text_height + vertical_padding * 2.5
+        
+        page.draw_rect(
+            rect=(x_scaled, y_scaled + text_offset - vertical_padding, 
+                  x_scaled + background_width, y_scaled + text_offset + background_height),
+            color=(1, 1, 0), overlay=True, fill_opacity=0.9, fill=(1, 1, 0)
+        )
+        
+        text_x = x_scaled + padding
+        text_y = y_scaled + text_offset
+        for i, line in enumerate(lines):
+            page.insert_text(point=(text_x, text_y + (i * text_size * 1.5)), text=line, fontsize=text_size, color=(0, 0, 0))
+
+    def add_freehand_line_annotation(self, page, points):
+        """Add freehand line drawing to the PDF page."""
+        if not points or len(points) < 2:
+            return     
+        # Set line properties
+        stroke_color = (0, 0, 0)  # Black color   
+        # Calculate scaling factor for line width based on page size
+        scaling_factor = max(page.rect.width, page.rect.height) / 1000
+        line_width = 2 * scaling_factor  # Adjust line width based on page size      
+        # Convert the points to a continuous line
+        page.draw_polyline(points, color=stroke_color, width=line_width)
+
+    def add_plain_text_annotation(self, page, x_scaled, y_scaled, text):
+        """Add plain text annotation to the PDF page."""
+        try:
+            text_size = 18  # Default text size
+            scaling_factor = max(page.rect.width, page.rect.height) / 1000
+            adjusted_text_size = int(text_size * scaling_factor)
+            
+            # Ensure text stays within page boundaries
+            max_width = page.rect.width - x_scaled - 20  # 20-unit buffer from edge
+            
+            # Convert text to properly wrapped text if needed
+            wrapped_text = self.wrap_text_for_saving(text, max_width, adjusted_text_size)
+            
+            # Add the text to the PDF
+            page.insert_text(
+                point=(x_scaled, y_scaled),
+                text=wrapped_text,
+                fontsize=adjusted_text_size,
+                color=(0, 0, 0)  # Black color
+            )
+        except Exception as e:
+            print(f"Error adding text annotation: {e}")
+
+    def wrap_text_for_saving(self, text, max_width, font_size):
+        """Ensure text is properly wrapped before saving to PDF."""
+        # PyMuPDF doesn't automatically wrap text, so we need to do it manually
+        # Approximate character width based on font size
+        char_width = font_size * 0.5  # Rough estimate
+        
+        # Calculate max chars per line
+        max_chars = int(max_width / char_width * 0.9)  # 10% safety margin
+        max_chars = max(min(max_chars, 80), 5)  # Reasonable bounds
+        
+        # If text already contains newlines, respect them
+        if '\n' in text:
+            lines = text.split('\n')
+            wrapped_lines = []
+            for line in lines:
+                if len(line) <= max_chars:
+                    wrapped_lines.append(line)
+                else:
+                    # Wrap this line
+                    words = line.split()
+                    current_line = []
+                    current_length = 0
+                    
+                    for word in words:
+                        word_len = len(word)
+                        space_len = 1 if current_length > 0 else 0
+                        
+                        if current_length + word_len + space_len > max_chars:
+                            if current_line:  # Add current line if it exists
+                                wrapped_lines.append(' '.join(current_line))
+                            current_line = [word]
+                            current_length = word_len
+                        else:
+                            current_line.append(word)
+                            current_length += word_len + space_len
+                    
+                    if current_line:  # Add the last line
+                        wrapped_lines.append(' '.join(current_line))
+            
+            return '\n'.join(wrapped_lines)
+        else:
+            # Wrap text that doesn't already have newlines
+            words = text.split()
+            lines = []
+            current_line = []
+            current_length = 0
+            
+            for word in words:
+                word_len = len(word)
+                space_len = 1 if current_length > 0 else 0
+                
+                if current_length + word_len + space_len > max_chars:
+                    if current_line:  # Add current line if it exists
+                        lines.append(' '.join(current_line))
+                    current_line = [word]
+                    current_length = word_len
+                else:
+                    current_line.append(word)
+                    current_length += word_len + space_len
+            
+            if current_line:  # Add the last line
+                lines.append(' '.join(current_line))
+            
+            return '\n'.join(lines)
+
+    def add_text_with_bg_annotation(self, page, x_scaled, y_scaled, text):
+        """Add text with background annotation to the PDF page."""
+        text_size = 18 # Default text size
+        scaling_factor = max(page.rect.width, page.rect.height) / 1000
+        adjusted_text_size = int(text_size * scaling_factor)
+        padding = int(15 * scaling_factor)
+        
+        # Calculate text dimensions for background
+        lines = text.split('\n')
+        max_width = max(len(line) for line in lines) * adjusted_text_size * 0.6
+        text_height = len(lines) * adjusted_text_size * 1.2
+        
+        # Draw background rectangle
+        page.draw_rect(
+            rect=(x_scaled - padding, y_scaled - padding, 
+                x_scaled + max_width + padding, y_scaled + text_height + padding),
+            color=(0, 1, 1),  # Cyan color
+            fill=(0, 1, 1),
+            fill_opacity=0.9
+        )   
+        # Insert text on top of background
+        for i, line in enumerate(lines):
+            page.insert_text(
+                point=(x_scaled, y_scaled + (i * adjusted_text_size * 1.2)),
+                text=line,
+                fontsize=adjusted_text_size,
+                color=(0, 0, 0)  # Black color
+            )
+            
+    def wrap_text(self, text, max_line_length):
+        """Wrap the text into lines with a maximum number of characters per line."""
+        words = text.split(" ")
+        lines = []
+        current_line = ""
+        for word in words:
+            if len(current_line) + len(word) + 1 <= max_line_length:
+                current_line += (word + " ")
+            else:
+                lines.append(current_line.strip())
+                current_line = word + " "
+        if current_line:
+            lines.append(current_line.strip())
+        return lines
+    
+    def update_page_display(self):
+        if self.pdf_document:
+            total_pages = len(self.pdf_document)
+            self.page_entry.delete(0, ctk.END)
+            self.page_entry.insert(0, str(self.current_page + 1))  # One-based index
+            self.page_total_label.configure(text=f"/ {total_pages}")
+    
+    def prev_page(self, event=None):
+        """Go to the previous page in the PDF."""
+        if not self.pdf_document or self.current_page is None:
+            messagebox.showerror("Error", "No PDF loaded.")
+            return
+        if self.current_page > 0:
+            print(f"Page Width: {self.page_width}, Page Height: {self.page_height}")
+            self.current_page -= 1
+            self.render_page(self.current_page)
+            self.update_thumbnail_selection(self.current_page)
+            self.update_page_display()
+
+    def next_page(self, event=None):
+        """Go to the next page in the PDF."""
+        if not self.pdf_document or self.current_page is None:
+            messagebox.showerror("Error", "No PDF loaded.")
+            return
+        if self.current_page < len(self.pdf_document) - 1:
+            print(f"Page Width: {self.page_width}, Page Height: {self.page_height}")
+            self.current_page += 1
+            self.render_page(self.current_page)
+            self.update_thumbnail_selection(self.current_page)
+            self.update_page_display()
+
+    def rotate_90clockwise(self):
+        """Rotate the current page clockwise."""
+        if not self.pdf_document or self.current_page is None:
+            messagebox.showerror("Error", "No PDF loaded.")
+            return
+        page = self.pdf_document[self.current_page]
+        page.set_rotation((page.rotation + 90) % 360)
+        self.render_page(self.current_page)
+
+    def rotate_180clockwise(self):
+        """Rotate the current page clockwise."""
+        if not self.pdf_document or self.current_page is None:
+            messagebox.showerror("Error", "No PDF loaded.")
+            return
+        page = self.pdf_document[self.current_page]
+        page.set_rotation((page.rotation + 180) % 360)
+        self.render_page(self.current_page)
+
+    def rotate_270clockwise(self):
+        """Rotate the current page clockwise."""
+        if not self.pdf_document or self.current_page is None:
+            messagebox.showerror("Error", "No PDF loaded.")
+            return
+        page = self.pdf_document[self.current_page]
+        page.set_rotation((page.rotation + 270) % 360)
+        self.render_page(self.current_page)
+
+    def toggle_invert_colors(self):
+        """Toggle color inversion for the PDF."""
+        if not self.pdf_document or self.current_page is None:
+            messagebox.showerror("Error", "No PDF loaded.")
+            return
+        self.is_inverted = not self.is_inverted
+        self.render_page(self.current_page)
+        self.redraw_sticky_notes()
+
+
+    def zoom_in_area(self, event):
+        """Zoom into a specific area of the canvas based on mouse click."""
+        if not self.pdf_document:
+            messagebox.showerror("Error", "No PDF loaded.")
+            return
+
+        # Get the canvas click position adjusted for scrolling
+        canvas_x = self.canvas.canvasx(event.x) / self.zoom_factor
+        canvas_y = self.canvas.canvasy(event.y) / self.zoom_factor
+
+        # Define the zoom area dimensions
+        zoom_area_size = 150
+        left = max(0, canvas_x - zoom_area_size // 2)
+        top = max(0, canvas_y - zoom_area_size // 2)
+        right = min(self.page_width, canvas_x + zoom_area_size // 1)
+        bottom = min(self.page_height, canvas_y + zoom_area_size // 2)
+
+        # Calculate the zoom factors for the selected area
+        canvas_width = self.canvas.winfo_width()
+        canvas_height = self.canvas.winfo_height()
+        zoom_width_factor = canvas_width / (right - left)
+        zoom_height_factor = canvas_height / (bottom - top)
+
+        # Update the zoom factor to fit the selected area
+        self.zoom_factor = min(zoom_width_factor, zoom_height_factor)
+
+        # Render the selected zoomed-in area
+        page = self.pdf_document.load_page(self.current_page)
+        matrix = fitz.Matrix(self.zoom_factor, self.zoom_factor)
+
+        # Translate the viewport to the selected area
+        translation_matrix = fitz.Matrix(1, 0, 0, 1, -left, -top)
+        combined_matrix = matrix * translation_matrix
+        pix = page.get_pixmap(matrix=combined_matrix, clip=(left, top, right, bottom))
+
+        # Convert the pixmap to an image
+        img = Image.open(io.BytesIO(pix.tobytes("png")))
+        if self.is_inverted:
+            img = ImageOps.invert(img.convert("RGB"))
+        img_tk = ImageTk.PhotoImage(img)
+
+        # Update the canvas with the new zoomed-in area
+        self.canvas.delete("all")
+        self.canvas.create_image(0, 0, anchor="nw", image=img_tk)
+        self.canvas.img_tk = img_tk
+
+        # Update canvas scroll region
+        self.page_width, self.page_height = pix.width, pix.height
+        self.canvas.configure(scrollregion=(0, 0, self.page_width, self.page_height))
+        # Disable zoom-in area mode after use
+        self.toggle_zoom_in_area_mode()
+
+    def toggle_zoom_in_area_mode(self):
+        """Toggle the mode to allow zooming into a specific area."""
+        if hasattr(self, "zoom_in_area_enabled") and self.zoom_in_area_enabled:
+            self.canvas.unbind("<Button-1>")
+            self.zoom_in_area_enabled = False
+        else:
+            self.canvas.bind("<Button-1>", self.zoom_in_area)
+            self.zoom_in_area_enabled = True
+
+    def toggle_drawing(self):
+        """Toggle the freehand drawing mode without embedding strokes into the PDF."""
+        if not self.pdf_document or self.current_page is None:
+            messagebox.showerror("Error", "No PDF loaded.")
+            return
+        self.is_drawing = not self.is_drawing  # Toggle drawing mode
+        if self.is_drawing:
+            self.canvas.bind("<Button-1>", self.start_freehand_drawing)
+            self.canvas.bind("<B1-Motion>", self.draw_freehand_line)
+            self.canvas.bind("<ButtonRelease-1>", self.finish_freehand_drawing)
+        else:
+            self.canvas.unbind("<Button-1>")
+            self.canvas.unbind("<B1-Motion>")
+            self.canvas.unbind("<ButtonRelease-1>")
+
+    def start_freehand_drawing(self, event):
+        """Start recording a freehand drawing stroke with unscaled coordinates."""
+        self.freehand_stroke = [(event.x / self.zoom_factor, event.y / self.zoom_factor)]
+        self.current_line = self.canvas.create_line(
+            self.freehand_stroke[0][0] * self.zoom_factor,
+            self.freehand_stroke[0][1] * self.zoom_factor,
+            self.freehand_stroke[0][0] * self.zoom_factor,
+            self.freehand_stroke[0][1] * self.zoom_factor, 
+            fill="black" if not self.is_inverted else "white", width=2
+        )
+
+    def draw_freehand_line(self, event):
+        """Draw a freehand stroke in real-time with unscaled coordinates."""
+        if not hasattr(self, "freehand_stroke"):
+            return
+
+        x, y = event.x / self.zoom_factor, event.y / self.zoom_factor
+        page_width = self.page_width / self.zoom_factor
+        page_height = self.page_height / self.zoom_factor
+
+        # Ensure the stroke stays within the page bounds
+        x = max(0, min(x, page_width))
+        y = max(0, min(y, page_height))
+
+        self.freehand_stroke.append((x, y))
+        scaled_points = [(px * self.zoom_factor, py * self.zoom_factor) for px, py in self.freehand_stroke]
+        self.canvas.coords(self.current_line, *sum(scaled_points, ()))
+
+    def finish_freehand_drawing(self, event):
+        """Save the drawn freehand stroke for undo functionality without embedding into the PDF."""
+        if not hasattr(self, "freehand_stroke") or len(self.freehand_stroke) < 2:
+            return
+        self.freehand_drawings.append((self.current_page, self.current_line, self.freehand_stroke))
+        self.change_history.append(("freehand", self.current_page, self.current_line, self.freehand_stroke))
+
+        self.annotation_is_available = True
+        del self.freehand_stroke
+        del self.current_line
+        self.toggle_drawing()
+        self.render_page(self.current_page)  # Re-render to ensure it's drawn correctly
+        self.redraw_freehand_drawings()
+        self.annotation_listed.append("freehand")
+
+    def redraw_freehand_drawings(self):
+        """Redraw all freehand drawings, applying zoom and rotation transformations."""
+        self.canvas.delete("freehand")  # Clear previous drawings
+
+        for i, entry in enumerate(self.change_history):
+            if entry[0] == "freehand":
+                _, page, line_id, points = entry
+                if page != self.current_page:
+                    continue
+                
+                transformed_points = [self.apply_transformations(x, y) for x, y in points]
+                scaled_points = [(x * self.zoom_factor, y * self.zoom_factor) for x, y in transformed_points]
+                fill_color = "black" if not self.is_inverted else "white"
+                new_line_id = self.canvas.create_line(
+                    *sum(scaled_points, ()),
+                    fill=fill_color, width=3, tags="freehand"
+                )
+                self.change_history[i] = ("freehand", page, new_line_id, points)
+    def apply_transformations(self, x, y):
+        """Apply rotation first, then zoom transformations to a given point."""
+        page = self.pdf_document[self.current_page]
+        rotation_angle = page.rotation
+        page_width = self.page_width / self.zoom_factor  # Unscaled width
+        page_height = self.page_height / self.zoom_factor  # Unscaled height
+
+        # Apply rotation without zooming
+        if rotation_angle == 90:
+            if is_small_page == "yes":
+                x, y = page_height+(180) - y, x
+            elif is_small_page == "slightly":
+                x,y = page_height+(1050)-y,x
+            elif is_small_page == "longer":
+                x, y = page_height+(720) - y, x
+            elif is_small_page == "maybe":
+                x, y = page_height+(750) - y, x
+            elif is_small_page == "nope large":
+                x, y = page_height+(1000) - y, x
+            elif is_small_page == "nope very large":
+                x, y = page_height+(43000) - y, x
+            else:
+                x, y = page_height+(2000) - y, x
+        elif rotation_angle == 180:
+            x, y = page_width - x, page_height - y
+        elif rotation_angle == 270:
+            if is_small_page == "yes":
+                x, y = y, page_width-(180) - x
+            elif is_small_page == "slightly":
+                x,y = y, page_width-(1050) - x
+            elif is_small_page == "longer":
+                x, y = y, page_width-(720) - x
+            elif is_small_page == "maybe":
+                x, y = y, page_width-(750) - x
+            elif is_small_page == "nope large":
+                x, y = y, page_width-(1000) - x
+            elif is_small_page == "nope very large":
+                x, y = y, page_width-(4300) - x
+            else:
+                x, y = y, page_width-(2000) - x
+        return x, y
+
+    def toggle_filled_polygon_mode(self):
+        """Toggle filled polygon drawing mode."""
+        if not self.pdf_document or self.current_page is None:
+            messagebox.showerror("Error", "No PDF loaded.")
+            return
+
+        if self.polygon_mode == "filled":
+            # Deactivate the mode
+            self.filled_polygon_button.configure(text="")
+            self.polygon_mode = None
+            self.start_point = None
+            self.polygon_created = False  # Reset creation flag
+            self.polygon_active = "no"
+            self.canvas.unbind("<Button-1>")
+            self.canvas.config(cursor="arrow")
+            # self.embed_polygons_in_pdf()
+            self.redraw_polygons()
+        else:
+            # Deactivate hollow mode if active
+            if self.polygon_mode == "hollow":
+                self.hollow_polygon_button.configure(text="")
+
+            # Activate filled mode
+            self.filled_polygon_button.configure(text="#")
+            self.polygon_active = "yes"
+            self.polygon_mode = "filled"
+            self.start_point = None
+            self.polygon_created = False  # Reset creation flag
+            self.canvas.bind("<Button-1>", self.on_canvas_polygon_click)
+
+
+    def toggle_hollow_polygon_mode(self):
+        """Toggle hollow polygon drawing mode."""
+        if not self.pdf_document or self.current_page is None:
+            messagebox.showerror("Error", "No PDF loaded.")
+            return
+
+        if self.polygon_mode == "hollow":
+            # Deactivate the mode
+            self.hollow_polygon_button.configure(text="")
+            self.polygon_mode = None
+            self.start_point = None
+            self.polygon_active = "no"
+            self.polygon_created = False  # Reset creation flag
+            self.canvas.unbind("<Button-1>")
+            self.canvas.config(cursor="arrow")
+            self.redraw_polygons()
+            # self.embed_polygons_in_pdf()
+        else:
+            # Deactivate filled mode if active
+            if self.polygon_mode == "filled":
+                self.filled_polygon_button.configure(text="")
+
+            # Activate hollow mode
+            self.hollow_polygon_button.configure(text="#")
+            self.polygon_active = "yes"
+            self.polygon_mode = "hollow"
+            self.start_point = None
+            self.polygon_created = False  # Reset creation flag
+            self.canvas.bind("<Button-1>", self.on_canvas_polygon_click)
+
+
+    def is_point_inside_polygon(self, x, y, points):
+        num_points = len(points) // 2
+        polygon = [(points[i * 2], points[i * 2 + 1]) for i in range(num_points)]
+        inside = False
+
+        for i in range(num_points):
+            x1, y1 = polygon[i]
+            x2, y2 = polygon[(i + 1) % num_points]
+
+            if ((y1 > y) != (y2 > y)) and (x < (x2 - x1) * (y - y1) / (y2 - y1) + x1):
+                inside = not inside
+
+        return inside
+
+    def generate_polygon_points(self, x, y, radius, sides):
+        """Generate the points of a regular polygon with given sides and radius."""
+        points = []
+        for i in range(sides):
+            angle = 2 * math.pi * i / sides
+            px = x + radius * math.cos(angle)
+            py = y + radius * math.sin(angle)
+            points.append(px)
+            points.append(py)
+        return points
+
+    def on_canvas_polygon_click(self, event):
+        """Handle canvas clicks for creating or modifying polygons."""
+        if not self.polygon_mode:
+            return
+        
+        # Convert the click position to PDF space
+        x = self.canvas.canvasx(event.x) / self.zoom_factor
+        y = self.canvas.canvasy(event.y) / self.zoom_factor
+
+        if self.current_page not in self.page_drawings:
+            self.page_drawings[self.current_page] = []
+
+        for idx, drawing in enumerate(self.page_drawings[self.current_page]):
+            if len(drawing) != 3:
+                continue
+
+            mode, points, polygon_id = drawing
+
+            if self.is_point_inside_polygon(x, y, points):
+                self.canvas.config(cursor="hand2")
+
+                # Convert the zoom factor correctly for dragging
+                zoom_adjusted_radius = max(10, 15 / self.zoom_factor)
+                for i in range(0, len(points), 2):
+                    vx, vy = points[i], points[i + 1]
+                    if abs(vx - x) < zoom_adjusted_radius and abs(vy - y) < zoom_adjusted_radius:
+                        self.dragging_polygon = (idx, i // 2)
+                        self.canvas.bind("<B1-Motion>", self.on_polygon_drag_vertex)
+                        self.canvas.bind("<ButtonRelease-1>", self.on_polygon_drag_release)
+                        self.canvas.config(cursor="fleur")
+                        return
+
+                self.dragging_polygon = (idx, None)
+                self.start_drag_x, self.start_drag_y = x, y
+                self.canvas.bind("<B1-Motion>", self.on_polygon_drag_entire)
+                self.canvas.bind("<ButtonRelease-1>", self.on_polygon_drag_release)
+                self.canvas.config(cursor="fleur")
+                return
+
+        # If a new polygon needs to be created
+        if self.start_point is None:
+            self.start_point = (x, y)
+
+            points = self.generate_polygon_points(
+                x, y, 
+                self.polygon_size / self.zoom_factor, 
+                5
+            )
+
+            # Scale points back for display on the canvas
+            scaled_points = [coord * self.zoom_factor for coord in points]
+
+            polygon_id = self.canvas.create_polygon(
+                scaled_points,
+                fill="blue" if self.polygon_mode == "filled" else "",
+                outline="blue" if self.polygon_mode == "filled" else "red",
+                tags=("polygon",)
+            )
+
+            self.page_drawings[self.current_page].append((self.polygon_mode, points, polygon_id))
+            self.change_history.append(("polygon", self.current_page, None, polygon_id))
+            self.annotation_listed.append("polygon")
+        else:
+            self.start_point = None
+
+        self.redraw_polygons()
+
+    def embed_polygons_in_pdf(self):
+        """Embed only existing polygons in the PDF with proper scaling."""
+        if not self.pdf_document or self.current_page not in self.page_drawings:
+            return  # No valid PDF or no drawings on the current page
+
+        page = self.pdf_document[self.current_page]
+        
+        # Remove old polygon annotations before embedding new ones
+        for annot in page.annots():
+            if annot.info.get("title") == "polygon_annotation":
+                annot.delete()
+
+        zoom_matrix = fitz.Matrix(self.zoom_factor, self.zoom_factor)
+        self.annotation_is_available = True
+
+        # Ensure only non-removed polygons get embedded
+        remaining_polygons = []
+        
+        for drawing in self.page_drawings[self.current_page]:  
+            if len(drawing) != 3:
+                print(f"Skipping invalid entry: {drawing}")
+                continue
+
+            mode, points, polygon_id = drawing
+
+            # Check if this polygon has been removed via undo
+            if self.current_page in self.embedded_polygons:
+                if any(p[2] == polygon_id for p in self.embedded_polygons[self.current_page]):
+                    continue  # Skip embedding removed polygons
+
+            scaled_points = [(points[i] / self.zoom_factor, points[i + 1] / self.zoom_factor)
+                            for i in range(0, len(points), 2)]
+
+            path = page.new_shape()
+            for i in range(len(scaled_points)):
+                p1 = scaled_points[i]
+                p2 = scaled_points[(i + 1) % len(scaled_points)]
+                path.draw_line(p1, p2)
+
+            if mode == "filled":
+                path.finish(fill=(0, 0, 1), color=None)
+            elif mode == "hollow":
+                path.finish(color=(1, 0, 0), fill=None)
+
+            path.commit()
+
+            remaining_polygons.append(drawing)  # Only keep actually embedded polygons
+
+        self.embedded_polygons[self.current_page] = remaining_polygons  # Update embedded list
+        
+
+    def on_polygon_drag_vertex(self, event):
+        if not hasattr(self, 'dragging_polygon'):
+            return
+
+        idx, vertex_idx = self.dragging_polygon
+        if vertex_idx is None:
+            return
+
+        mode, points, polygon_id = self.page_drawings[self.current_page][idx]
+        x = self.canvas.canvasx(event.x) / self.zoom_factor
+        y = self.canvas.canvasy(event.y) / self.zoom_factor
+
+        x = max(0, min(x, self.page_width / self.zoom_factor))
+        y = max(0, min(y, self.page_height / self.zoom_factor))
+
+        points[vertex_idx * 2] = x
+        points[vertex_idx * 2 + 1] = y
+
+        scaled_points = [p * self.zoom_factor for p in points]
+        self.canvas.coords(polygon_id, *scaled_points)
+
+
+    def on_polygon_drag_entire(self, event):
+        if not hasattr(self, 'dragging_polygon'):
+            return
+        idx, _ = self.dragging_polygon
+        mode, points, polygon_id = self.page_drawings[self.current_page][idx]
+        x, y = self.canvas.canvasx(event.x) / self.zoom_factor, self.canvas.canvasy(event.y) / self.zoom_factor
+        dx, dy = x - self.start_drag_x, y - self.start_drag_y
+
+        # Constrain entire polygon to remain inside the page boundary
+        min_x = min(points[::2]) + dx
+        min_y = min(points[1::2]) + dy
+        max_x = max(points[::2]) + dx
+        max_y = max(points[1::2]) + dy
+
+        if min_x < 0 or max_x > self.page_width / self.zoom_factor or min_y < 0 or max_y > self.page_height / self.zoom_factor:
+            return  # Prevent movement outside the page
+
+        for i in range(0, len(points), 2):
+            points[i] += dx
+            points[i + 1] += dy
+
+        scaled_points = [(p * self.zoom_factor) for p in points]
+        self.canvas.coords(polygon_id, scaled_points)
+
+        self.start_drag_x, self.start_drag_y = x, y
+
+
+    def on_polygon_drag_release(self, event):
+        """Release the polygon after dragging."""
+        if hasattr(self, 'dragging_polygon'):
+            del self.dragging_polygon
+        self.canvas.unbind("<B1-Motion>")
+        self.canvas.unbind("<ButtonRelease-1>")
+        self.redraw_polygons()
+
+    def attach_image_to_pdf(self):
+        """Attach an image to the currently loaded PDF with interactive placement and resizing."""
+        if not self.pdf_document:
+            messagebox.showerror("Error", "No PDF loaded.")
+            return
+            
+        image_path = filedialog.askopenfilename(
+            title="Select an Image",
+            filetypes=[("Image Files", "*.png;*.jpg;*.jpeg"), ("All Files", "*.*")])
+            
+        if not image_path:
+            return  # User canceled the dialog
+            
+        try:
+            img = Image.open(image_path)
+            img.thumbnail((200, 200), Image.LANCZOS)  # Initial size
+            self.tk_image = ImageTk.PhotoImage(img)  # Convert to Tkinter-compatible format
+            
+            # Create the image on canvas
+            self.active_image = self.canvas.create_image(
+                100, 100, 
+                image=self.tk_image, 
+                anchor="nw", 
+                tags="temp_image_overlay"
+            )
+            
+            # Store the image data for manipulation
+            self.image_data = {
+                "id": f"img_{len(self.image_overlays)}",
+                "image_path": image_path,
+                "image_obj": img,
+                "x": 100, "y": 100,
+                "width": img.width, "height": img.height,
+                "base_x": 100 / self.zoom_factor,  # Store unscaled coordinates
+                "base_y": 100 / self.zoom_factor,
+                "base_width": img.width / self.zoom_factor,
+                "base_height": img.height / self.zoom_factor,
+                "page": self.current_page
+            }
+            
+            # Bind events for manipulation
+            self.canvas.tag_bind(self.active_image, "<ButtonPress-1>", self.start_move)
+            self.canvas.tag_bind(self.active_image, "<B1-Motion>", self.do_move)
+            self.canvas.tag_bind(self.active_image, "<ButtonRelease-1>", self.finalize_move)
+            self.canvas.bind_all("<MouseWheel>", self.resize_image)
+            
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to load image: {str(e)}")
+
+    def start_move(self, event):
+        """Start dragging the image."""
+        self.image_data["start_x"] = event.x
+        self.image_data["start_y"] = event.y
+
+    def do_move(self, event):
+        """Move the image as the mouse drags."""
+        dx = event.x - self.image_data["start_x"]
+        dy = event.y - self.image_data["start_y"]
+        
+        self.canvas.move(self.active_image, dx, dy)
+        self.image_data["x"] += dx
+        self.image_data["y"] += dy
+        
+        # Update base coordinates (unscaled)
+        self.image_data["base_x"] = self.image_data["x"] / self.zoom_factor
+        self.image_data["base_y"] = self.image_data["y"] / self.zoom_factor
+        
+        self.image_data["start_x"] = event.x
+        self.image_data["start_y"] = event.y
+
+    def finalize_move(self, event):
+        """Finalize the image overlay position."""
+        user_response = messagebox.askyesnocancel(
+            "Confirm Position",
+            "Are you satisfied with the current position and size of the image? To Resize hold shift and scroll")
+            
+        if user_response is None:  # User clicked 'Cancel'
+            self.canvas.delete(self.active_image)  # Remove the temporary image from canvas
+            self.active_image = None
+            self.image_data = None
+            return
+            
+        if not user_response:  # User clicked 'No', allow them to move/reshape again
+            return  # Do nothing, letting them continue adjusting the image
+        
+        self.annotation_is_available = True
+        
+        try:
+            # Create the final overlay information
+            overlay_info = {
+                "id": self.image_data["id"],
+                "type": "image_overlay",
+                "image_path": self.image_data["image_path"],
+                "x": self.image_data["x"],
+                "y": self.image_data["y"],
+                "width": self.image_data["width"],
+                "height": self.image_data["height"],
+                "base_x": self.image_data["base_x"],
+                "base_y": self.image_data["base_y"],
+                "base_width": self.image_data["base_width"],
+                "base_height": self.image_data["base_height"],
+                "page": self.current_page,
+                "canvas_id": self.active_image
+            }
+            
+            # Add to image overlays list and change history
+            self.image_overlays.append(overlay_info)
+            self.change_history.append(("image_overlay", self.current_page, overlay_info))
+            
+            # Remove the temporary image and redraw it as a permanent one
+            self.canvas.delete("temp_image_overlay")
+            self.redraw_image_overlays(self.current_page)
+            
+            # Unbind events - this prevents the image from being moved after finalization
+            self.canvas.unbind_all("<MouseWheel>")
+            self.active_image = None
+            self.annotation_listed.append("image_overlay")
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to add image overlay: {e}")
+
+    def resize_image(self, event):
+        """Resize the image using the mouse scroll."""
+        if event.state & 0x0001 == 0:
+            return  # Shift not pressed; ignore scroll
+            
+        scale_factor = 1.1 if event.delta > 0 else 0.9
+        
+        # Calculate new width and height
+        new_width = int(self.image_data["width"] * scale_factor)
+        new_height = int(self.image_data["height"] * scale_factor)
+        
+        # Prevent the image from becoming too small
+        if new_width < 50 or new_height < 50:
+            return
+            
+        # Update image data
+        self.image_data["width"] = new_width
+        self.image_data["height"] = new_height
+        self.image_data["base_width"] = new_width / self.zoom_factor
+        self.image_data["base_height"] = new_height / self.zoom_factor
+        
+        # Resize the image
+        img_resized = self.image_data["image_obj"].resize((new_width, new_height), Image.LANCZOS)
+        self.tk_image = ImageTk.PhotoImage(img_resized)
+        self.canvas.itemconfig(self.active_image, image=self.tk_image)
+
+
+
+    # def add_text_to_pdf(self):
+    #     """Enable text-adding mode on the PDF."""
+    #     if not self.pdf_document or self.current_page is None:
+    #         messagebox.showerror("Error", "No PDF loaded.")
+    #         return
+    #     self.canvas.bind("<Button-1>", self.on_add_text_click)
+    #     self.add_text_mode = True
+
+    # def on_add_text_click(self, event):
+    #     """Handle adding text overlay at the clicked position."""
+    #     if not self.pdf_document or not self.add_text_mode:
+    #         return
+
+    #     x = self.canvas.canvasx(event.x)
+    #     y = self.canvas.canvasy(event.y)
+        
+    #     if x < 0 or x > self.page_width or y < 0 or y > self.page_height:
+    #         return
+
+    #     text = self.ask_for_note_text(x, y, "Add Text")
+    #     if not text:
+    #         return
+
+    #     wrapped_text = "\n".join(textwrap.wrap(text, width=30))
+    #     x_scaled = x / self.zoom_factor
+    #     y_scaled = y / self.zoom_factor
+
+    #     # Store text annotation instead of inserting into PDF
+    #     self.text_annotations[(self.current_page, x_scaled, y_scaled)] = wrapped_text
+        
+    #     # Store change history for undo
+    #     # changes_data = ("add_text", self.current_page, x_scaled, y_scaled, text)
+    #     # changes_data = str(changes_data)
+    #     # sql_check = """
+    #     #     SELECT COUNT(*) FROM pdf_editor_details 
+    #     #     WHERE folder_path = %s AND filename = %s AND changes_data = %s
+    #     # """
+    #     # mycursor.execute(sql_check, (folderpath, beforeexe, changes_data))
+    #     # result = mycursor.fetchone()
+    #     # if result[0] == 0:
+    #     #     sql = "CALL sp_InsertPDFEditorDetails(%s, %s, %s, %s)"
+    #     #     val = (beforeexe,folderpath,changes_data,0)
+    #     #     mycursor.execute(sql, val)
+    #     #     mydb.commit()
+    #     self.change_history.append(("add_text", self.current_page, x_scaled, y_scaled, text))
+
+    #     self.render_page(self.current_page)  # Refresh page to show the new text
+    #     self.add_text_mode = False
+    #     self.canvas.unbind("<Button-1>")
+    #     self.annotation_is_available = True
+    #     self.annotation_listed.append("text")
+    # def redraw_text_annotations(self):
+    #     """Redraw text annotations after rendering the page and adjust for zoom and rotation."""
+    #     self.canvas.delete("text_annotation")  # Clear previous annotations
+
+    #     if not self.pdf_document:
+    #         return
+
+    #     page = self.pdf_document[self.current_page]
+    #     rotation_angle = page.rotation  # Get current page rotation
+    #     fill_color = "black" if not self.is_inverted else "white"
+
+    #     for (page_num, x_scaled, y_scaled), text in self.text_annotations.items():
+    #         if page_num == self.current_page:
+    #             x_position = x_scaled * self.zoom_factor
+    #             y_position = y_scaled * self.zoom_factor
+
+    #             # Get page dimensions at the current zoom level
+    #             page_width = page.rect.width * self.zoom_factor
+    #             page_height = page.rect.height * self.zoom_factor
+    #             # Adjust coordinates based on rotation
+    #             if rotation_angle == 90:  # Rotate text **clockwise**
+    #                 if is_small_page == "yes":
+    #                     rotated_x, rotated_y = self.page_height+(180*self.zoom_factor) - y_position, x_position
+    #                 elif is_small_page == "slightly":
+    #                     rotated_x, rotated_y = self.page_height+(1050*self.zoom_factor) - y_position, x_position
+    #                 elif is_small_page == "maybe":
+    #                     rotated_x, rotated_y = self.page_height+(750*self.zoom_factor) - y_position, x_position
+    #                 elif is_small_page == "nope large":
+    #                     rotated_x, rotated_y = self.page_height+(1000*self.zoom_factor) - y_position, x_position
+    #                 elif is_small_page == "nope very large":
+    #                     rotated_x, rotated_y = self.page_height+(4300*self.zoom_factor) - y_position, x_position
+    #                 else:
+    #                     rotated_x, rotated_y = self.page_height+(2000*self.zoom_factor) - y_position, x_position
+
+    #                 angle = -90  # Fix: Rotate text correctly to the right
+    #             elif rotation_angle == 180:  # Rotate text upside down
+    #                 rotated_x = page_width - x_position
+    #                 rotated_y = page_height - y_position
+    #                 angle = 180
+    #             elif rotation_angle == 270:  # Rotate text **counterclockwise**
+    #                 if is_small_page == "yes":
+    #                     rotated_x, rotated_y = y_position, self.page_width-(180*self.zoom_factor) - x_position
+    #                 elif is_small_page == "slightly":
+    #                     rotated_x, rotated_y = y_position, self.page_width-(1050*self.zoom_factor) - x_position 
+    #                 elif is_small_page == "maybe":
+    #                    rotated_x, rotated_y = y_position, self.page_width-(750*self.zoom_factor) - x_position 
+    #                 elif is_small_page == "nope large":
+    #                     rotated_x, rotated_y = y_position, self.page_width-(1000*self.zoom_factor) - x_position
+    #                 elif is_small_page == "nope very large":
+    #                     rotated_x, rotated_y = y_position, self.page_width-(4300*self.zoom_factor) - x_position
+    #                 else:
+    #                     rotated_x, rotated_y = y_position, self.page_width-(2000*self.zoom_factor) - x_position
+    #                 angle = -270  # Fix: Rotate text correctly to the left
+    #             else:  # 0 degrees (default)
+    #                 rotated_x = x_position
+    #                 rotated_y = y_position
+    #                 angle = 0
+
+    #             text_id = self.canvas.create_text(
+    #                 rotated_x, rotated_y,
+    #                 text=text,
+    #                 font=("Arial", 16),
+    #                 fill=fill_color,
+    #                 tags="text_annotation",
+    #                 anchor="nw"
+    #             )
+
+    #             # Apply corrected rotation to the text
+    #             self.canvas.itemconfig(text_id, angle=angle)
+
+    #     self.annotation_is_available = True
+    def add_text_to_pdf(self):
+        """Enable text-adding mode on the PDF."""
+        if not self.pdf_document or self.current_page is None:
+            messagebox.showerror("Error", "No PDF loaded.")
+            return
+        self.canvas.bind("<Button-1>", self.on_add_text_click)
+        self.add_text_mode = True
+
+    def on_add_text_click(self, event):
+        """Handle adding text overlay at the clicked position with strict boundary enforcement."""
+        if not self.pdf_document or not self.add_text_mode:
+            return
+        
+        x = self.canvas.canvasx(event.x)
+        y = self.canvas.canvasy(event.y)
+        
+        if x < 0 or x > self.page_width or y < 0 or y > self.page_height:
+            return
+            
+        text = self.ask_for_note_text(x, y, "Add Text")
+        if not text:
+            return
+            
+        x_scaled = x / self.zoom_factor
+        y_scaled = y / self.zoom_factor
+        
+        # Get the page dimensions
+        page = self.pdf_document[self.current_page]
+        page_width_scaled = page.rect.width
+        
+        # Calculate the maximum width for text container
+        # Ensure text container never exceeds page boundaries
+        max_text_width = min(page_width_scaled - x_scaled - 20, page_width_scaled * 0.4)
+        
+        # Store this as part of the annotation data
+        annotation_data = {
+            "text": text,
+            "max_width": max_text_width,
+            "font_size": 16
+        }
+        
+        # Store the text with its constraints
+        self.text_annotations[(self.current_page, x_scaled, y_scaled)] = annotation_data
+        
+        # Add to history
+        self.change_history.append(("add_text", self.current_page, x_scaled, y_scaled, text))
+        
+        # Update display
+        self.render_page(self.current_page)
+        self.add_text_mode = False
+        self.canvas.unbind("<Button-1>")
+        self.annotation_is_available = True
+        self.annotation_listed.append("text")
+
+    def redraw_text_annotations(self):
+        """Redraw text annotations with strict boundary enforcement."""
+        self.canvas.delete("text_annotation")  # Clear previous annotations
+        
+        if not self.pdf_document:
+            return
+            
+        page = self.pdf_document[self.current_page]
+        rotation_angle = page.rotation
+        fill_color = "black" if not self.is_inverted else "white"
+        
+        for (page_num, x_scaled, y_scaled), annotation_data in self.text_annotations.items():
+            if page_num == self.current_page:
+                # If using the old format (just text string), convert to new format
+                if isinstance(annotation_data, str):
+                    annotation_data = {
+                        "text": annotation_data,
+                        "max_width": page.rect.width * 0.4,  # default to 40% of page width
+                        "font_size": 16
+                    }
+                
+                text = annotation_data["text"]
+                max_width = annotation_data["max_width"] * self.zoom_factor
+                font_size = annotation_data["font_size"]
+                
+                x_position = x_scaled * self.zoom_factor
+                y_position = y_scaled * self.zoom_factor
+                # Adjust coordinates based on rotation
+                if rotation_angle == 90:  # Rotate text **clockwise**
+                    if is_small_page == "yes":
+                        rotated_x, rotated_y = self.page_height+(180*self.zoom_factor) - y_position, x_position
+                    elif is_small_page == "slightly":
+                        rotated_x, rotated_y = self.page_height+(1050*self.zoom_factor) - y_position, x_position
+                    elif is_small_page == "longer":
+                        rotated_x, rotated_y = self.page_height+(720*self.zoom_factor) - y_position, x_position
+                    elif is_small_page == "maybe":
+                        rotated_x, rotated_y = self.page_height+(750*self.zoom_factor) - y_position, x_position
+                    elif is_small_page == "nope large":
+                        rotated_x, rotated_y = self.page_height+(1000*self.zoom_factor) - y_position, x_position
+                    elif is_small_page == "nope very large":
+                        rotated_x, rotated_y = self.page_height+(4300*self.zoom_factor) - y_position, x_position
+                    else:
+                        rotated_x, rotated_y = self.page_height+(2000*self.zoom_factor) - y_position, x_position
+
+                    angle = -90  # Fix: Rotate text correctly to the right
+                    container_width = max_width
+                elif rotation_angle == 180:  # Rotate text upside down
+                    rotated_x = page.rect.width * self.zoom_factor - x_position
+                    rotated_y = page.rect.height * self.zoom_factor - y_position
+                    angle = 180
+                    container_width = max_width
+                elif rotation_angle == 270:  # Rotate text **counterclockwise**
+                    if is_small_page == "yes":
+                        rotated_x, rotated_y = y_position, self.page_width-(180*self.zoom_factor) - x_position
+                    elif is_small_page == "slightly":
+                        rotated_x, rotated_y = y_position, self.page_width-(1050*self.zoom_factor) - x_position
+                    elif is_small_page == "longer":
+                        rotated_x, rotated_y = y_position, self.page_width-(720*self.zoom_factor) - x_position 
+                    elif is_small_page == "maybe":
+                       rotated_x, rotated_y = y_position, self.page_width-(750*self.zoom_factor) - x_position 
+                    elif is_small_page == "nope large":
+                        rotated_x, rotated_y = y_position, self.page_width-(1000*self.zoom_factor) - x_position
+                    elif is_small_page == "nope very large":
+                        rotated_x, rotated_y = y_position, self.page_width-(4300*self.zoom_factor) - x_position
+                    else:
+                        rotated_x, rotated_y = y_position, self.page_width-(2000*self.zoom_factor) - x_position
+                    angle = -270  # Fix: Rotate text correctly to the left
+                    container_width = max_width
+                else:  # 0 degrees (default)
+                    rotated_x = x_position
+                    rotated_y = y_position
+                    angle = 0
+                    container_width = max_width
+
+                text_container = self.canvas.create_text(
+                    rotated_x, rotated_y,
+                    text=text,
+                    font=("Arial", font_size),
+                    fill=fill_color,
+                    width=container_width,  # This is critical - it forces text wrapping
+                    tags="text_annotation",
+                    anchor="nw")
+                
+                # Apply rotation if needed
+                self.canvas.itemconfig(text_container, angle=angle)
+        
+        self.annotation_is_available = True
+
+    def add_text_with_background(self):
+        """Enable text-adding mode for text with a background."""
+        if not self.pdf_document or self.current_page is None:
+            messagebox.showerror("Error", "No PDF loaded.")
+            return
+        self.canvas.bind("<Button-1>", self.on_add_text_with_bg_click)
+        self.add_text_bg_mode = True
+
+    def on_add_text_with_bg_click(self, event):
+        """Handle adding text with a background at the clicked position."""
+        if not self.pdf_document or not self.add_text_bg_mode:
+            return
+
+        x = self.canvas.canvasx(event.x)
+        y = self.canvas.canvasy(event.y)
+
+        if x < 0 or x > self.page_width or y < 0 or y > self.page_height:
+            return
+
+        text = self.ask_for_note_text(x, y, "Add Text with Background")
+        if not text:
+            return
+
+        wrapped_text = "\n".join(textwrap.wrap(text, width=30))
+        x_scaled = x / self.zoom_factor
+        y_scaled = y / self.zoom_factor
+
+        fontsize = 16
+        text_lines = wrapped_text.split("\n")
+        max_width = max(len(line) for line in text_lines) * fontsize * 0.6
+        text_height = fontsize * 1.2 * len(text_lines)
+
+        # Store the text annotation with background instead of embedding in PDF
+        self.text_annotations_bg[(self.current_page, x_scaled, y_scaled)] = wrapped_text
+
+        #Store change history for undo
+        # changes_data = ("add_text_bg", self.current_page, x_scaled, y_scaled, text)
+        # changes_data = str(changes_data)
+        # sql_check = """
+        #     SELECT COUNT(*) FROM pdf_editor_details 
+        #     WHERE folder_path = %s AND filename = %s AND changes_data = %s
+        # """
+        # mycursor.execute(sql_check, (folderpath, beforeexe, changes_data))
+        # result = mycursor.fetchone()
+        # if result[0] == 0:
+        #     sql = "CALL sp_InsertPDFEditorDetails(%s, %s, %s, %s)"
+        #     val = (beforeexe,folderpath,changes_data,0)
+        #     mycursor.execute(sql, val)
+        #     mydb.commit()
+        self.change_history.append(("add_text_bg", self.current_page, x_scaled, y_scaled, text))
+
+        self.render_page(self.current_page)  # Refresh page to show new annotation
+        self.add_text_bg_mode = False
+        self.canvas.unbind("<Button-1>")
+        self.annotation_is_available = True
+        self.annotation_listed.append("text_bg")
+
+    def redraw_text_with_background(self):
+        """Redraw text annotations with background after rendering the page and adjust for zoom and rotation."""
+        self.canvas.delete("text_annotation_bg")  # Clear previous background text
+
+        if not self.pdf_document:
+            return
+
+        page = self.pdf_document[self.current_page]
+        rotation_angle = page.rotation  # Get current page rotation
+        fill_color = "black" if not self.is_inverted else "white"
+        for (page_num, x_scaled, y_scaled), text in self.text_annotations_bg.items():
+            if page_num == self.current_page:
+                x_position = x_scaled * self.zoom_factor
+                y_position = y_scaled * self.zoom_factor
+
+                # Get page dimensions at the current zoom level
+                page_width = page.rect.width * self.zoom_factor
+                page_height = page.rect.height * self.zoom_factor
+
+                fontsize = 16
+                wrapped_text = "\n".join(textwrap.wrap(text, width=30))
+                text_lines = wrapped_text.split("\n")
+                max_width = max(len(line) for line in text_lines) * fontsize * 0.6
+                text_height = fontsize * 1.2 * len(text_lines)
+                # Adjust coordinates based on rotation
+                if rotation_angle == 90:  # Rotate text **clockwise**
+                    if is_small_page == "yes":
+                        rotated_x, rotated_y = self.page_height+(180*self.zoom_factor) - y_position, x_position
+                    elif is_small_page == "slightly":
+                        rotated_x, rotated_y = self.page_height+(1050*self.zoom_factor) - y_position, x_position
+                    elif is_small_page == "longer":
+                        rotated_x, rotated_y = self.page_height+(720*self.zoom_factor) - y_position, x_position
+                    elif is_small_page == "maybe":
+                        rotated_x, rotated_y = self.page_height+(750*self.zoom_factor) - y_position, x_position
+                    elif is_small_page == "nope large":
+                        rotated_x, rotated_y = self.page_height+(1000*self.zoom_factor) - y_position, x_position
+                    elif is_small_page == "nope very large":
+                        rotated_x, rotated_y = self.page_height+(4300*self.zoom_factor) - y_position, x_position
+                    else:
+                        rotated_x, rotated_y = self.page_height+(2000*self.zoom_factor) - y_position, x_position
+                    rect_x1 = rotated_x - text_height - 15
+                    rect_y1 = rotated_y
+                    rect_x2 = rotated_x
+                    rect_y2 = rotated_y + max_width + 10
+                    angle = -90  # Fix: Rotate text correctly to the right
+                elif rotation_angle == 180:  # Rotate text upside down
+                    rotated_x = page_width - x_position
+                    rotated_y = page_height - y_position
+                    rect_x1 = rotated_x - max_width - 10
+                    rect_y1 = rotated_y - text_height - 15
+                    rect_x2 = rotated_x
+                    rect_y2 = rotated_y
+                    angle = 180
+                elif rotation_angle == 270:  # Rotate text **counterclockwise**
+                    if is_small_page == "yes":
+                        rotated_x, rotated_y = y_position, self.page_width-(180*self.zoom_factor) - x_position
+                    elif is_small_page == "slightly":
+                        rotated_x, rotated_y = y_position, self.page_width-(1050*self.zoom_factor) - x_position
+                    elif is_small_page == "longer":
+                        rotated_x, rotated_y = y_position, self.page_width-(720*self.zoom_factor) - x_position
+                    elif is_small_page == "maybe":
+                        rotated_x, rotated_y = y_position, self.page_width-(750*self.zoom_factor) - x_position
+                    elif is_small_page == "nope large":
+                        rotated_x, rotated_y = y_position, self.page_width-(1000*self.zoom_factor) - x_position
+                    elif is_small_page == "nope very large":
+                        rotated_x, rotated_y = y_position, self.page_width-(4300*self.zoom_factor) - x_position
+                    else:
+                        rotated_x, rotated_y = y_position, self.page_width-(2000*self.zoom_factor) - x_position
+                    rect_x1 = rotated_x
+                    rect_y1 = rotated_y - max_width - 10
+                    rect_x2 = rotated_x + text_height + 15
+                    rect_y2 = rotated_y
+                    angle = -270  # Fix: Rotate text correctly to the left
+                else:  # 0 degrees (default)
+                    rotated_x = x_position
+                    rotated_y = y_position
+                    rect_x1 = rotated_x
+                    rect_y1 = rotated_y
+                    rect_x2 = rotated_x + max_width + 10
+                    rect_y2 = rotated_y + text_height + 15
+                    angle = 0
+
+                rect_id = self.canvas.create_rectangle(
+                    rect_x1, rect_y1, rect_x2, rect_y2,
+                    fill="cyan",
+                    outline="cyan",
+                    tags="text_annotation_bg"
+                )
+          
+                text_id = self.canvas.create_text(
+                    rotated_x, rotated_y,
+                    text=text,
+                    font=("Arial", 16),
+                    fill=fill_color,
+                    tags="text_annotation",
+                    anchor="nw"
+                )
+
+                self.canvas.itemconfig(text_id, angle=angle)
+
+        self.annotation_is_available = True
+
+    def activate_line_tool(self):
+        """Activate the straight line drawing tool."""
+        if not self.pdf_document or self.current_page is None:
+            messagebox.showerror("Error", "No PDF loaded.")
+            return
+        self.deactivate_tools()
+        self.is_drawing_line = True
+        self.canvas.bind("<Button-1>", self.start_line)
+        self.canvas.bind("<B1-Motion>", self.draw_line_preview)
+        self.canvas.bind("<ButtonRelease-1>", self.finish_line)
+
+    def activate_arrow_tool(self):
+        """Activate the arrow drawing tool."""
+        if not self.pdf_document or self.current_page is None:
+            messagebox.showerror("Error", "No PDF loaded.")
+            return
+        self.deactivate_tools()
+        self.is_drawing_arrow = True
+        self.canvas.bind("<Button-1>", self.start_line)
+        self.canvas.bind("<B1-Motion>", self.draw_line_preview)
+        self.canvas.bind("<ButtonRelease-1>", self.finish_arrow)
+
+    def deactivate_tools(self):
+        """Deactivate all tools."""
+        self.is_drawing_line = False
+        self.is_drawing_arrow = False
+        self.is_drawing_hollow_rect = False
+        self.is_drawing_filled_rect = False
+        self.current_rectangle = None
+        self.deactivate_selection_mode()
+        self.canvas.unbind("<Button-1>")
+        self.canvas.unbind("<B1-Motion>")
+        self.canvas.unbind("<ButtonRelease-1>")
+
+    def start_line(self, event):
+        """Start drawing a line or arrow."""
+        self.start_x = self.canvas.canvasx(event.x)
+        self.start_y = self.canvas.canvasy(event.y)
+        self.current_line = None
+
+    def draw_line_preview(self, event):
+        """Show a preview of the line or arrow while dragging."""
+        if self.current_line:
+            self.canvas.delete(self.current_line)
+        end_x = self.canvas.canvasx(event.x)
+        end_y = self.canvas.canvasy(event.y)
+        
+        if self.is_drawing_line:
+            self.current_line = self.canvas.create_line(
+                self.start_x, self.start_y, end_x, end_y,
+                fill="red", width=3, tags="annotation_preview")
+        elif self.is_drawing_arrow:
+            self.current_line = self.canvas.create_line(
+                self.start_x, self.start_y, end_x, end_y,
+                fill="red", width=3, arrow=ctk.LAST, 
+                arrowshape=(16, 20, 6), tags="annotation_preview")
+
+    def finish_line(self, event):
+        """Finish drawing the line and add it to annotations."""
+        end_x = self.canvas.canvasx(event.x)
+        end_y = self.canvas.canvasy(event.y)
+        
+        # Create visual line on canvas
+        line_id = self.canvas.create_line(
+            self.start_x, self.start_y, end_x, end_y,
+            fill="red", width=3, tags="annotation")
+        
+        # Store line data (in original PDF coordinates)
+        line_data = {
+            'type': 'line',
+            'page': self.current_page,
+            'x1': self.start_x / self.zoom_factor,
+            'y1': self.start_y / self.zoom_factor,
+            'x2': end_x / self.zoom_factor,
+            'y2': end_y / self.zoom_factor,
+            'id': line_id
+        }
+        
+        self.lines.append(line_data)
+        self.annotations.append(line_data)
+        self.change_history.append(('add_annotation', line_data))
+        self.annotation_is_available = True
+        self.deactivate_tools()
+        self.annotation_listed.append("line")
+    def finish_arrow(self, event):
+        """Finish drawing the arrow and add it to annotations."""
+        end_x = self.canvas.canvasx(event.x)
+        end_y = self.canvas.canvasy(event.y)
+        
+        # Create visual arrow on canvas
+        arrow_id = self.canvas.create_line(
+            self.start_x, self.start_y, end_x, end_y,
+            fill="red", width=3, arrow=ctk.LAST, 
+            arrowshape=(16, 20, 6), tags="annotation")
+        
+        # Store arrow data (in original PDF coordinates)
+        arrow_data = {
+            'type': 'arrow',
+            'page': self.current_page,
+            'x1': self.start_x / self.zoom_factor,
+            'y1': self.start_y / self.zoom_factor,
+            'x2': end_x / self.zoom_factor,
+            'y2': end_y / self.zoom_factor,
+            'id': arrow_id
+        }
+        
+        self.arrows.append(arrow_data)
+        self.annotations.append(arrow_data)
+        self.change_history.append(('add_annotation', arrow_data))
+        self.annotation_is_available = True
+        self.deactivate_tools()
+        self.annotation_listed.append("arrow")
+
+    def activate_hollow_rectangle_tool(self):
+        """Activate the hollow rectangle drawing tool."""
+        if not self.pdf_document or self.current_page is None:
+            messagebox.showerror("Error", "No PDF loaded.")
+            return
+        self.deactivate_tools()
+        self.is_drawing_hollow_rect = True
+        self.is_drawing_filled_rect = False  # Ensure only one mode is active
+        self.highlight_mode = False
+        self.canvas.bind("<Button-1>", self.start_rectangle_drawing)
+        self.canvas.bind("<B1-Motion>", self.draw_rectangle_preview)
+        self.canvas.bind("<ButtonRelease-1>", self.finish_hollow_rectangle)
+
+    def activate_filled_rectangle_tool(self):
+        """Activate the filled rectangle drawing tool."""
+        if not self.pdf_document or self.current_page is None:
+            messagebox.showerror("Error", "No PDF loaded.")
+            return
+        self.deactivate_tools()
+        self.is_drawing_filled_rect = True
+        self.is_drawing_hollow_rect = False
+        self.highlight_mode = False
+        self.canvas.bind("<Button-1>", self.start_rectangle_drawing)
+        self.canvas.bind("<B1-Motion>", self.draw_rectangle_preview)
+        self.canvas.bind("<ButtonRelease-1>", self.finish_filled_rectangle)
+
+    def start_rectangle_drawing(self, event):
+        """Start drawing a rectangle (for hollow/filled tools)."""
+        self.start_x = self.canvas.canvasx(event.x)
+        self.start_y = self.canvas.canvasy(event.y)
+        if self.current_rectangle:
+            self.canvas.delete(self.current_rectangle)
+        outline_color = "red"
+        fill_color = "" if self.is_drawing_hollow_rect else "red"
+        self.current_rectangle = self.canvas.create_rectangle(
+            self.start_x, self.start_y, self.start_x + 1, self.start_y + 1,
+            outline=outline_color, fill=fill_color, width=2, tags="annotation_preview")
+
+    def draw_rectangle_preview(self, event):
+        """Show a preview of the rectangle while dragging."""
+        if self.current_rectangle:
+            self.canvas.delete(self.current_rectangle)
+        end_x = self.canvas.canvasx(event.x)
+        end_y = self.canvas.canvasy(event.y)
+        outline_color = "red"
+        fill_color = "" if self.is_drawing_hollow_rect else "red"
+        self.current_rectangle = self.canvas.create_rectangle(
+            self.start_x, self.start_y, end_x, end_y,
+            outline=outline_color, fill=fill_color, width=3, tags="annotation_preview")
+
+    def finish_hollow_rectangle(self, event):
+        """Finish drawing the hollow rectangle and add it to annotations."""
+        self.finish_rectangle(event, filled=False)
+
+    def finish_filled_rectangle(self, event):
+        """Finish drawing the filled rectangle and add it to annotations."""
+        self.finish_rectangle(event, filled=True)
+
+    def finish_rectangle(self, event, filled):
+        """Finish drawing a rectangle and add it to annotations."""
+        end_x = self.canvas.canvasx(event.x)
+        end_y = self.canvas.canvasy(event.y)
+        
+        # Ensure coordinates are properly ordered (top-left to bottom-right)
+        x1, y1 = min(self.start_x, end_x), min(self.start_y, end_y)
+        x2, y2 = max(self.start_x, end_x), max(self.start_y, end_y)
+        
+        # Delete the preview rectangle
+        if self.current_rectangle:
+            self.canvas.delete(self.current_rectangle)
+        
+        # Create visual rectangle on canvas
+        outline_color = "red"
+        fill_color = "" if not filled else "red"
+        rect_id = self.canvas.create_rectangle(
+            x1, y1, x2, y2,
+            outline=outline_color, fill=fill_color, width=3, tags="annotation")
+        
+        # Store rectangle data (in original PDF coordinates)
+        rect_data = {
+            'type': 'rectangle',
+            'page': self.current_page,
+            'x1': x1 / self.zoom_factor,
+            'y1': y1 / self.zoom_factor,
+            'x2': x2 / self.zoom_factor,
+            'y2': y2 / self.zoom_factor,
+            'filled': filled,
+            'id': rect_id,
+            'color': "red"
+        }
+        
+        self.rectangles.append(rect_data)
+        self.annotations.append(rect_data)
+        self.change_history.append(('add_annotation', rect_data))
+        self.annotation_is_available = True
+        self.deactivate_tools()
+        self.annotation_listed.append("rectangle")
+
+    def activate_hollow_ellipse(self):
+        self.ellipse_mode = "hollow"
+        self.canvas.bind("<ButtonPress-1>", self.start_ellipse)
+        self.canvas.bind("<B1-Motion>", self.draw_ellipse)
+        self.canvas.bind("<ButtonRelease-1>", self.finalize_ellipse)
+    
+    def activate_filled_ellipse(self):
+        self.ellipse_mode = "filled"
+        self.canvas.bind("<ButtonPress-1>", self.start_ellipse)
+        self.canvas.bind("<B1-Motion>", self.draw_ellipse)
+        self.canvas.bind("<ButtonRelease-1>", self.finalize_ellipse)
+    
+    def start_ellipse(self, event):
+        # Store the actual canvas coordinates (accounting for scrolling)
+        canvas_x = self.canvas.canvasx(event.x)
+        canvas_y = self.canvas.canvasy(event.y)
+        
+        # Store the unscaled coordinates by dividing by the zoom factor
+        self.start_point = (canvas_x / self.zoom_factor, canvas_y / self.zoom_factor)
+        self.current_ellipse = None
+
+    def draw_ellipse(self, event):
+        if not self.start_point:
+            return
+        
+        # Get original unscaled start coordinates
+        x1, y1 = self.start_point
+        
+        # Get current canvas coordinates and unscale them
+        canvas_x = self.canvas.canvasx(event.x)
+        canvas_y = self.canvas.canvasy(event.y)
+        x2, y2 = canvas_x / self.zoom_factor, canvas_y / self.zoom_factor
+        
+        # For display, scale both coordinates by zoom factor
+        display_x1, display_y1 = x1 * self.zoom_factor, y1 * self.zoom_factor
+        display_x2, display_y2 = x2 * self.zoom_factor, y2 * self.zoom_factor
+        
+        if self.current_ellipse:
+            self.canvas.delete(self.current_ellipse)
+        
+        outline = "orange"
+        fill = "" if self.ellipse_mode == "hollow" else "orange"
+        self.current_ellipse = self.canvas.create_oval(
+            display_x1, display_y1, display_x2, display_y2, 
+            outline=outline, width=3, fill=fill, tags="ellipse"
+        )
+
+    def finalize_ellipse(self, event):
+        if not self.start_point or not self.current_ellipse:
+            return
+        
+        # Get original unscaled coordinates
+        x1, y1 = self.start_point
+        
+        # Get current position and unscale it
+        canvas_x = self.canvas.canvasx(event.x)
+        canvas_y = self.canvas.canvasy(event.y)
+        x2, y2 = canvas_x / self.zoom_factor, canvas_y / self.zoom_factor
+        
+        # Store the original unscaled coordinates in annotations
+        self.annotations.append(("ellipse", x1, y1, x2, y2, self.current_ellipse, self.ellipse_mode,self.current_page))
+        self.change_history.append(("ellipse", x1, y1, x2, y2, self.current_ellipse, self.ellipse_mode))
+        
+        self.ellipse_mode = None
+        self.start_point = None
+        
+        # Reset bindings
+        self.canvas.bind("<Button-1>", self.on_canvas_click)
+        self.canvas.unbind("<B1-Motion>")
+        self.canvas.unbind("<ButtonRelease-1>")
+        self.annotation_listed.append("ellipse")
+
+    def deactivate_selection_mode(self):
+        """Clean up after selection mode to avoid binding conflicts."""
+        # Restore original bindings instead of just unbinding
+        self.canvas.bind("<Button-1>", self.on_canvas_click)
+        self.canvas.bind("<Motion>", self.on_mouse_hover)
+        
+        # Clear any existing zoom rectangle
+        if hasattr(self, 'zoom_rectangle') and self.zoom_rectangle:
+            self.canvas.delete(self.zoom_rectangle)
+            self.zoom_rectangle = None
+        
+        self.is_zooming_area = False
+
+
+    def activate_selection_mode(self):
+        """Activate the zoom area tool."""
+        if not self.pdf_document or self.current_page is None:
+            messagebox.showerror("Error", "No PDF loaded.")
+            return
+        
+        # Properly deactivate all tools first
+        self.deactivate_tools()
+        
+        # Reset the zoom rectangle reference
+        self.zoom_rectangle = None
+        self.is_zooming_area = True
+        
+        # Apply new bindings
+        self.canvas.bind("<Button-1>", self.start_zoom_area)
+        self.canvas.bind("<B1-Motion>", self.draw_zoom_rectangle)
+        self.canvas.bind("<ButtonRelease-1>", self.finish_zoom_area)
+        
+    def start_zoom_area(self, event):
+        """Start drawing the zoom selection rectangle."""
+        self.start_x = self.canvas.canvasx(event.x)
+        self.start_y = self.canvas.canvasy(event.y)
+        self.zoom_rectangle = self.canvas.create_rectangle(
+            self.start_x, self.start_y, self.start_x, self.start_y, outline="blue", width=2
+        )
+        
+    def draw_zoom_rectangle(self, event):
+        """Update the rectangle as the user drags the mouse."""
+        current_x = self.canvas.canvasx(event.x)
+        current_y = self.canvas.canvasy(event.y)
+        self.canvas.coords(self.zoom_rectangle, self.start_x, self.start_y, current_x, current_y)
+
+
+####################################### fast and better ##############################################
+    def finish_zoom_area(self, event):
+        """Zoom into the selected area and keep it centered accurately."""
+        if not hasattr(self, 'zoom_rectangle') or self.zoom_rectangle is None:
+            return
+        
+        end_x = self.canvas.canvasx(event.x)
+        end_y = self.canvas.canvasy(event.y)
+        x1, y1 = min(self.start_x, end_x), min(self.start_y, end_y)
+        x2, y2 = max(self.start_x, end_x), max(self.start_y, end_y)
+        
+        # Don't proceed with very small selections
+        if (x2 - x1) < 5 or (y2 - y1) < 5:
+            self.deactivate_selection_mode()
+            return
+            
+        x1_pdf, y1_pdf = x1 / self.zoom_factor, y1 / self.zoom_factor
+        x2_pdf, y2_pdf = x2 / self.zoom_factor, y2 / self.zoom_factor
+        selected_width = x2_pdf - x1_pdf
+        selected_height = y2_pdf - y1_pdf
+        
+        if selected_width <= 0 or selected_height <= 0:
+            self.deactivate_selection_mode()
+            return  # Prevent invalid selections
+            
+        canvas_width = self.canvas.winfo_width()
+        canvas_height = self.canvas.winfo_height()
+        zoom_x = canvas_width / selected_width
+        zoom_y = canvas_height / selected_height
+        new_zoom_factor = min(zoom_x, zoom_y)
+        new_zoom_factor = max(0.1, min(new_zoom_factor, 10))
+        
+        center_x_pdf = (x1_pdf + x2_pdf) / 2
+        center_y_pdf = (y1_pdf + y2_pdf) / 2
+        self.zoom_factor = new_zoom_factor
+        
+        # Delete zoom rectangle before rendering to avoid artifacts
+        self.canvas.delete(self.zoom_rectangle)
+        self.zoom_rectangle = None
+
+        expected_width = int(self.page_width * self.zoom_factor)
+        expected_height = int(self.page_height * self.zoom_factor)
+        expected_pixels = expected_width * expected_height
+
+        MAX_PIXELS = 178956970  # PIL default safety limit
+
+        if expected_pixels > MAX_PIXELS:
+            messagebox.showerror("Zoom Error", "Pixel size has increased beyond the safe threshold.")
+            self.deactivate_selection_mode()
+            return
+        
+        self.render_page(self.current_page)
+        
+        # Calculate scrolling position to center the zoomed area
+        scroll_x = ((center_x_pdf * new_zoom_factor) - (canvas_width / 2)) / self.page_width
+        scroll_y = ((center_y_pdf * new_zoom_factor) - (canvas_height / 2)) / self.page_height
+        scroll_x = max(0, min(scroll_x, 1))
+        scroll_y = max(0, min(scroll_y, 1))
+        
+        self.canvas.xview_moveto(scroll_x)
+        self.canvas.yview_moveto(scroll_y)
+        
+        # Properly deactivate the selection mode to restore normal functionality
+        self.deactivate_selection_mode()
+
+##############################################################################################################
+
+
+    def toggle_redaction_mode(self):
+        """Toggle redaction mode properly without requiring double clicks."""
+        if not self.pdf_document or self.current_page is None:
+            messagebox.showerror("Error", "No PDF loaded.")
+            return
+        if self.time_redact_used == 0:
+            messagebox.showinfo("Info", "Use redact only after adding all Annotations and changes if not the redact and annotations will be created on the same file.")
+            response = messagebox.askyesnocancel("Confirm", "Do you want to save changes before using the redact?")        
+            self.time_redact_used +=1
+            if response:
+                self.save_pdf()
+                if self.redaction_mode:
+                    self.deactivate_redact_tools()
+                else:
+                    self.activate_redaction_mode()
+            elif response is None:
+                return
+            else:
+                if self.redaction_mode:
+                    self.deactivate_redact_tools()
+                else:
+                    self.activate_redaction_mode()
+        else:
+            if self.redaction_mode:
+                self.deactivate_redact_tools()
+            else:
+                self.activate_redaction_mode()
+
+    def activate_redaction_mode(self):
+        """Ensure activation properly binds events and doesn't toggle incorrectly."""
+        self.redaction_mode = True
+        self.current_redaction = None  # Prevents lingering boxes
+        self.canvas.bind("<Button-1>", self.start_redaction)
+        self.canvas.bind("<B1-Motion>", self.draw_redaction_preview)
+        self.canvas.bind("<ButtonRelease-1>", self.finish_redaction)
+
+    def start_redaction(self, event):
+        """Start adding a redaction on click."""
+        self.start_x = self.canvas.canvasx(event.x)
+        self.start_y = self.canvas.canvasy(event.y)
+        self.current_redaction = None
+
+    def draw_redaction_preview(self, event):
+        """Show a redaction preview while dragging."""
+        if self.current_redaction:
+            self.canvas.delete(self.current_redaction)
+        end_x = self.canvas.canvasx(event.x)
+        end_y = self.canvas.canvasy(event.y)
+        self.current_redaction = self.canvas.create_rectangle(
+            self.start_x, self.start_y, end_x, end_y,
+            outline="black", fill="", width=2, tags="redaction_preview")
+
+    def finish_redaction(self, event):
+        """Finalize redaction on mouse release using proper PDF redaction annotation."""
+        if not self.redaction_mode:
+            return
+
+        end_x = self.canvas.canvasx(event.x)
+        end_y = self.canvas.canvasy(event.y)
+        x1, y1 = min(self.start_x, end_x) / self.zoom_factor, min(self.start_y, end_y) / self.zoom_factor
+        x2, y2 = max(self.start_x, end_x) / self.zoom_factor, max(self.start_y, end_y) / self.zoom_factor
+
+        rect = fitz.Rect(x1, y1, x2, y2)
+        page = self.pdf_document[self.current_page]
+
+        # Add redaction annotation
+        page.add_redact_annot(rect, fill=(0, 0, 0))
+        print("rect----",rect)
+        print("type of rect---",type(rect))
+        # type of rect--- <class 'pymupdf.Rect'>
+        # changes_data = (self.current_page, rect)
+        # changes_data = str(changes_data)
+        # sql = "CALL sp_InsertPDFEditorDetails(%s, %s, %s, %s)"
+        # val = (beforeexe,folderpath,changes_data,1)
+        # mycursor.execute(sql, val)
+        # mydb.commit()
+        self.redactions.append((self.current_page, rect))
+        self.redo_redactions.append((self.current_page,self.zoom_factor, rect))
+        print("self.redactions--*****",self.redactions)
+        print("self.redo_redactions----------*****",self.redo_redactions)
+        # Remove preview outline
+        if self.current_redaction:
+            self.canvas.delete(self.current_redaction)
+            self.current_redaction = None  
+        self.render_page(self.current_page)
+        self.deactivate_redact_tools()  # Ensure deactivation
+        self.redaction_mode = False
+        self.redact_is_available = True
+
+    def reappear_redact(self):
+        """Finalize redaction on mouse release using proper PDF redaction annotation."""
+        if not self.pdf_document or self.current_page is None:
+            messagebox.showerror("Error", "No PDF loaded.")
+            return
+        if len(self.redo_redactions)==0:
+            return
+        print("self.redo_redactions----------*****",self.redo_redactions)
+        for page_number,zoom_factor,rect in self.redo_redactions:
+            if page_number == self.current_page:
+                if self.zoom_factor > zoom_factor:
+                    zoom_factor = self.zoom_factor - zoom_factor
+                elif self.zoom_factor < zoom_factor:
+                    zoom_factor = zoom_factor - self.zoom_factor
+                elif self.zoom_factor == zoom_factor:
+                    zoom_factor = self.zoom_factor
+                print("zoom_factor******----",zoom_factor)
+                x1 = rect.x0 * zoom_factor
+                y1 = rect.y0 * zoom_factor
+                x2 = rect.x1 * zoom_factor
+                y2 = rect.y1 * zoom_factor
+                rect = fitz.Rect(x1, y1, x2, y2)
+                page = self.pdf_document[page_number]
+                page.add_redact_annot(rect, fill=(0, 0, 0))
+                self.redactions.append((self.current_page, rect))
+                self.current_redaction = None  
+        self.render_page(self.current_page)
+
+    def remove_black_boxes(self):
+        """Remove the most recent redaction annotation before applying them."""
+        if not self.pdf_document or self.current_page is None:
+            messagebox.showerror("Error", "No PDF loaded.")
+            return
+        if len(self.redactions)==0:
+            return
+        page = self.pdf_document[self.current_page]
+        for i in range(len(self.redactions) - 1, -1, -1):
+            page_number, rect = self.redactions[i]
+            if page_number == self.current_page:
+                annot = page.first_annot
+                while annot:
+                    next_annot = annot.next  # Get next annotation before deleting
+                    if self.rects_are_close(annot.rect, rect):
+                        page.delete_annot(annot)
+                        self.redactions.pop(i)
+                        self.render_page(self.current_page)
+                        return  # Stop after removing one
+                    annot = next_annot
+
+    def rects_are_close(self, rect1, rect2, tol=0.1):
+        """Check if two rectangles are approximately equal within a small tolerance."""
+        return (
+            abs(rect1.x0 - rect2.x0) <= tol and
+            abs(rect1.y0 - rect2.y0) <= tol and
+            abs(rect1.x1 - rect2.x1) <= tol and
+            abs(rect1.y1 - rect2.y1) <= tol
+        )
+    def deactivate_redact_tools(self):
+        """Deactivate the redaction tool and ensure all events are unbound."""
+        self.redaction_mode = False
+        self.canvas.unbind("<Button-1>")
+        self.canvas.unbind("<B1-Motion>")
+        self.canvas.unbind("<ButtonRelease-1>")
+        self.current_redaction = None  # Clear any leftover boxes
+
+
+    def activate_black_rectangle_tool(self):
+        """Activate the filled rectangle drawing tool."""
+        if not self.pdf_document or self.current_page is None:
+            messagebox.showerror("Error", "No PDF loaded.")
+            return
+        self.deactivate_tools()
+        self.is_drawing_filled_rect = True
+        self.is_drawing_hollow_rect = False
+        self.highlight_mode = False
+        self.canvas.bind("<Button-1>", self.start_blackrectangle_drawing)
+        self.canvas.bind("<B1-Motion>", self.draw_blackrectangle_preview)
+        self.canvas.bind("<ButtonRelease-1>", self.finish_blackfilled_rectangle)
+
+    def start_blackrectangle_drawing(self, event):
+        """Start drawing a rectangle (for hollow/filled tools)."""
+        self.start_x = self.canvas.canvasx(event.x)
+        self.start_y = self.canvas.canvasy(event.y)
+        if self.current_rectangle:
+            self.canvas.delete(self.current_rectangle)
+        outline_color = "black"
+        fill_color = "" if self.is_drawing_hollow_rect else "black"
+        self.current_rectangle = self.canvas.create_rectangle(
+            self.start_x, self.start_y, self.start_x + 1, self.start_y + 1,
+            outline=outline_color, fill=fill_color, width=3, tags="annotation_preview")
+
+    def draw_blackrectangle_preview(self, event):
+        """Show a preview of the rectangle while dragging."""
+        if self.current_rectangle:
+            self.canvas.delete(self.current_rectangle)
+        end_x = self.canvas.canvasx(event.x)
+        end_y = self.canvas.canvasy(event.y)
+        outline_color = "black"
+        fill_color = "" if self.is_drawing_hollow_rect else "black"
+        self.current_rectangle = self.canvas.create_rectangle(
+            self.start_x, self.start_y, end_x, end_y,
+            outline=outline_color, fill=fill_color, width=3, tags="annotation_preview")
+
+    def finish_blackfilled_rectangle(self, event):
+        """Finish drawing the filled rectangle and add it to annotations."""
+        self.finish_blackrectangle(event, filled=True)
+
+    def finish_blackrectangle(self, event, filled):
+        """Finish drawing a rectangle and add it to annotations."""
+        end_x = self.canvas.canvasx(event.x)
+        end_y = self.canvas.canvasy(event.y)
+        
+        # Ensure coordinates are properly ordered (top-left to bottom-right)
+        x1, y1 = min(self.start_x, end_x), min(self.start_y, end_y)
+        x2, y2 = max(self.start_x, end_x), max(self.start_y, end_y)
+        
+        # Delete the preview rectangle
+        if self.current_rectangle:
+            self.canvas.delete(self.current_rectangle)
+        
+        # Create visual rectangle on canvas
+        outline_color = "black"
+        fill_color = "" if not filled else "black"
+        rect_id = self.canvas.create_rectangle(
+            x1, y1, x2, y2,
+            outline=outline_color, fill=fill_color, width=3, tags="annotation")
+        
+        # Store rectangle data (in original PDF coordinates)
+        rect_data = {
+            'type': 'rectangle',
+            'page': self.current_page,
+            'x1': x1 / self.zoom_factor,
+            'y1': y1 / self.zoom_factor,
+            'x2': x2 / self.zoom_factor,
+            'y2': y2 / self.zoom_factor,
+            'filled': filled,
+            'id': rect_id,
+            'color': "black"
+        }
+        
+        self.rectangles.append(rect_data)
+        self.annotations.append(rect_data)
+        self.change_redact_history.append(('add_annotation', rect_data))
+        self.annotation_is_available = True
+        self.deactivate_tools()
+
+
+    def undo_blackrect(self):
+        print("Undoing the last change...",self.change_redact_history)
+        if not self.change_redact_history:
+            return
+        last_action = self.change_redact_history.pop()
+        action_type = last_action[0]               
+        if action_type == "add_annotation":
+            # New code for undoing line, arrow, rectangle, and ellipse annotations
+            annotation_data = last_action[1]
+            annotation_type = annotation_data.get('type')        
+            # Remove from canvas
+            if 'id' in annotation_data:
+                self.canvas.delete(annotation_data['id'])       
+            if annotation_type == 'rectangle':
+                self.rectangles = [rect for rect in self.rectangles if rect != annotation_data]
+                if self.annotation_listed[-1]=="rectangle":
+                    self.annotation_listed.pop()
+            # Remove from annotations list
+            self.annotations = [ann for ann in self.annotations 
+                            if not (isinstance(ann, dict) and ann.get('id') == annotation_data.get('id'))]
+            self.render_page(self.current_page)
+
+        else:
+            print(f"Unknown action type: {action_type}")
+
+
+    def verify_protocol_registration(self):
+        """Check and display the protocol registration status"""
+        handler = ProtocolHandler()
+        is_registered = handler.verify_registration()
+        if is_registered:
+            status_msg = (
+                "Protocol handler is properly registered.\n\n"
+                f"Protocol: {handler.protocol}\n"
+                f"OS: {handler.os_type}\n"
+                f"App Path: {handler.app_path}\n\n"
+                "The application will open automatically when clicking PDF links.")
+            messagebox.showinfo("Protocol Registration", status_msg)
+        else:
+            status_msg = (
+                "Protocol handler is not registered or registration is incomplete.\n\n"
+                f"Protocol: {handler.protocol}\n"
+                f"OS: {handler.os_type}\n"
+                f"App Path: {handler.app_path}\n\n"
+                "Would you like to attempt registration now?")
+            result = messagebox.askquestion(
+                "Protocol Registration", 
+                status_msg,
+                icon='warning')
+            if result == 'yes':
+                try:
+                    success, message = handler.register()
+                    if success:
+                        messagebox.showinfo(
+                            "Registration Success", 
+                            f"{message}\n\n"
+                            f"Protocol: {handler.protocol}\n"
+                            f"OS: {handler.os_type}\n"
+                            f"App Path: {handler.app_path}")
+                    else:
+                        messagebox.showerror(
+                            "Registration Failed", 
+                            f"{message}\n\n"
+                            "Please check the console for more details.")
+                except Exception as e:
+                    messagebox.showerror(
+                        "Registration Error", 
+                        f"Failed to register protocol handler:\n{str(e)}")
+
+if __name__ == "__main__":
+    # Register protocol handler during first run or installation
+    try:
+        handler = ProtocolHandler()
+        success, message = handler.register()
+        if success:
+            print(message)
+        else:
+            print(f"Warning: {message}")
+    except Exception as e:
+        print(f"Failed to register protocol handler: {e}")
+
+    root = ctk.CTk()
+    app = StickyNotesPDFApp(root)
+    root.mainloop()
+
+
+
+
+
